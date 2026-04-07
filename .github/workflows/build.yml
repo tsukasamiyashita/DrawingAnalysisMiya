@@ -1,0 +1,44 @@
+name: Build EXE
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # Python環境のセットアップ（安定した3.11を使用）
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    # 必要なライブラリのインストール
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    # PyInstallerでexe化の実行 (モジュール分割に対応)
+    - name: Build with PyInstaller
+      run: >
+        pyinstaller 
+        --onefile 
+        --noconsole 
+        --clean 
+        --name "DrawingAnalysisMiya-v1.0.0" 
+        --add-data "README.md;."
+        app.py
+
+    # 完成したexeファイルをGitHub上にアップロード
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: DrawingAnalysisMiya-v1.0.0
+        path: dist/DrawingAnalysisMiya-v1.0.0.exe

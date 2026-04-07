@@ -1,0 +1,29 @@
+# 目的
+
+pdfの2D機械図面を解析し、体積を割り出すpythonデスクトップアプリを作成してください。
+Gemini APIを使用して、各部品まで細かく計算してください。
+
+# 必須条件（ミニマム）
+
+- **app.py 1ファイル**で完結（短い日本語コメント可）
+
+- `requirements.txt` に必要依存
+
+
+
+# 生成するファイル
+
+1) `app.py`（本体）
+
+2) `requirements.txt`
+
+3) `.gitignore`（`__pycache__/`, `*.pyc`, `.env`, `.vscode/`）
+
+4) `README.md`
+
+
+
+
+# ファイル名
+
+DrawingAnalysisMiya
