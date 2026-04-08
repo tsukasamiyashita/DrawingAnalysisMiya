@@ -72,13 +72,17 @@ class DrawingAnalysisApp(ctk.CTk):
         self.processed_image_pil = None
         self.last_result_data = None # Excel出力用にデータを保持
         
-        # API設定を保持する辞書
+        # API設定を保持する辞書 (ステップごとにモデルを分割)
         self.api_settings = {
             "plan": "free",
             "free_key": "",
             "paid_key": "",
-            "free_model": "gemini-3-flash",
-            "paid_model": "gemini-3-flash",
+            "free_model_step1": "gemini-3-flash",
+            "free_model_step2": "gemini-3-flash",
+            "free_model_step3": "gemini-3-flash",
+            "paid_model_step1": "gemini-3-flash",
+            "paid_model_step2": "gemini-3-flash",
+            "paid_model_step3": "gemini-3-flash",
             "free_rpm": 12,
             "paid_rpm": 300,
             "free_threads": 1,
@@ -106,17 +110,37 @@ class DrawingAnalysisApp(ctk.CTk):
             pass
 
     def load_settings(self):
-        """設定を読み込み、UIに反映させる"""
+        """設定を読み込み、UIに反映させる。過去の設定からの自動移行も行う"""
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
-                    for key in ["free_model", "paid_model"]:
-                        if key in loaded and ("1.5" in loaded[key] or "2.0" in loaded[key]):
-                            loaded[key] = "gemini-3-flash"
+                    
+                    # 移行処理: 古い free_model / paid_model があれば各ステップにコピー
+                    for plan in ["free", "paid"]:
+                        old_key = f"{plan}_model"
+                        if old_key in loaded:
+                            old_val = loaded[old_key]
+                            # 1.5などは最新に変換
+                            if "1.5" in old_val or "2.0" in old_val:
+                                old_val = "gemini-3-flash"
+                            for step in ["step1", "step2", "step3"]:
+                                step_key = f"{plan}_model_{step}"
+                                if step_key not in loaded:
+                                    loaded[step_key] = old_val
+                            del loaded[old_key] # 古いキーは削除
+                    
+                    # すでに step1~3 が存在する場合の 1.5 などの変換
+                    for plan in ["free", "paid"]:
+                        for step in ["step1", "step2", "step3"]:
+                            step_key = f"{plan}_model_{step}"
+                            if step_key in loaded and ("1.5" in loaded[step_key] or "2.0" in loaded[step_key]):
+                                loaded[step_key] = "gemini-3-flash"
+
                     if "models_list" in loaded:
                         if any("1.5" in item[1] for item in loaded["models_list"]):
                             del loaded["models_list"]
+                            
                     self.api_settings.update(loaded)
             except Exception as e:
                 print(f"Load settings error: {e}")
@@ -284,7 +308,11 @@ class DrawingAnalysisApp(ctk.CTk):
             prefix = f"{plan}_"
             api_key = self.api_key_entry.get().strip()
             density = self.density_entry.get().strip() or "7.85"
-            model_name = self.api_settings.get(f"{prefix}model", "gemini-3-flash")
+            
+            # 各ステップのモデルを取得
+            model_name_step1 = self.api_settings.get(f"{prefix}model_step1", "gemini-3-flash")
+            model_name_step2 = self.api_settings.get(f"{prefix}model_step2", "gemini-3-flash")
+            model_name_step3 = self.api_settings.get(f"{prefix}model_step3", "gemini-3-flash")
             
             # 1. 画像とテキストデータの準備
             ext = os.path.splitext(self.selected_file_path)[1].lower()
@@ -311,7 +339,6 @@ class DrawingAnalysisApp(ctk.CTk):
             self.update_preview(self.processed_image_pil)
 
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(model_name)
             
             safety = None
             if self.api_settings.get(f"{prefix}safety", True):
@@ -334,7 +361,7 @@ class DrawingAnalysisApp(ctk.CTk):
             # ==========================================
             # ステップ1: 部品一覧の抽出
             # ==========================================
-            self.update_status(f"ステップ1: 部品一覧を抽出中 ({model_name})...")
+            self.update_status(f"ステップ1: 部品一覧を抽出中 ({model_name_step1})...")
             step1_prompt = f"""
             あなたは機械図面の解析エキスパートです。
             提供された図面画像とテキストデータから、「部品の一覧」のみをすべて抽出してください。
@@ -356,7 +383,8 @@ class DrawingAnalysisApp(ctk.CTk):
                 **common_generation_config_args
             )
             
-            response1 = model.generate_content([step1_prompt, self.processed_image_pil], generation_config=step1_config, safety_settings=safety)
+            model_step1 = genai.GenerativeModel(model_name_step1)
+            response1 = model_step1.generate_content([step1_prompt, self.processed_image_pil], generation_config=step1_config, safety_settings=safety)
             if not response1.candidates: raise Exception("ステップ1: AIからの応答が空でした。")
             
             part_list_data = self._parse_json_response(response1.text)
@@ -368,10 +396,12 @@ class DrawingAnalysisApp(ctk.CTk):
             # ==========================================
             # ステップ2: 個別部品の要素と寸法の抽出
             # ==========================================
+            model_step2 = genai.GenerativeModel(model_name_step2)
+            
             for idx, p_basic in enumerate(extracted_parts_basic):
                 p_name = p_basic.get("part_name", "不明")
                 p_num = p_basic.get("part_number", "")
-                self.update_status(f"ステップ2: 部品詳細を抽出中... ({idx+1}/{len(extracted_parts_basic)}) {p_name}")
+                self.update_status(f"ステップ2: 部品詳細を抽出中... ({idx+1}/{len(extracted_parts_basic)}) {p_name} ({model_name_step2})")
                 
                 step2_prompt = f"""
                 あなたは機械図面の解析エキスパートです。
@@ -398,7 +428,7 @@ class DrawingAnalysisApp(ctk.CTk):
                     **common_generation_config_args
                 )
                 
-                response2 = model.generate_content([step2_prompt, self.processed_image_pil], generation_config=step2_config, safety_settings=safety)
+                response2 = model_step2.generate_content([step2_prompt, self.processed_image_pil], generation_config=step2_config, safety_settings=safety)
                 
                 elements_data = self._parse_json_response(response2.text)
                 elements = elements_data.get('elements', []) if elements_data else []
@@ -415,7 +445,7 @@ class DrawingAnalysisApp(ctk.CTk):
             # ==========================================
             # ステップ3: 最終検証 (抽出漏れの確認)
             # ==========================================
-            self.update_status("ステップ3: 抽出漏れがないか図面を再検証中...")
+            self.update_status(f"ステップ3: 抽出漏れがないか図面を再検証中 ({model_name_step3})...")
             
             extracted_summary = "\n".join([f"- 品番:{p['part_number']} 品名:{p['part_name']}" for p in final_parts])
             
@@ -444,7 +474,8 @@ class DrawingAnalysisApp(ctk.CTk):
                 **common_generation_config_args
             )
             
-            response3 = model.generate_content([step3_prompt, self.processed_image_pil], generation_config=step3_config, safety_settings=safety)
+            model_step3 = genai.GenerativeModel(model_name_step3)
+            response3 = model_step3.generate_content([step3_prompt, self.processed_image_pil], generation_config=step3_config, safety_settings=safety)
             verification_data = self._parse_json_response(response3.text)
             
             if verification_data and 'missing_parts' in verification_data:
