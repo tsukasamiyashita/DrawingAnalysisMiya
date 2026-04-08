@@ -72,21 +72,38 @@ class DrawingAnalysisApp(ctk.CTk):
         self.processed_image_pil = None
         self.last_result_data = None # Excel出力用にデータを保持
         
-        # API設定を保持する辞書 (ステップごとにモデルを分割)
+        # モデル別パフォーマンス(RPM/スレッド)のデフォルト値
+        self.default_free_perf = {
+            "gemini-3-flash": {"rpm": 15, "threads": 1},
+            "gemini-3.1-pro-preview": {"rpm": 2, "threads": 1},
+            "gemini-3.1-flash-lite-preview": {"rpm": 15, "threads": 1},
+            "gemini-2.5-flash": {"rpm": 15, "threads": 1},
+            "gemini-2.5-pro": {"rpm": 2, "threads": 1}
+        }
+        self.default_paid_perf = {
+            "gemini-3-flash": {"rpm": 300, "threads": 5},
+            "gemini-3.1-pro-preview": {"rpm": 150, "threads": 5},
+            "gemini-3.1-flash-lite-preview": {"rpm": 300, "threads": 5},
+            "gemini-2.5-flash": {"rpm": 1000, "threads": 5},
+            "gemini-2.5-pro": {"rpm": 360, "threads": 5}
+        }
+        
+        # API設定を保持する辞書
         self.api_settings = {
             "plan": "free",
             "free_key": "",
             "paid_key": "",
+            
             "free_model_step1": "gemini-3-flash",
             "free_model_step2": "gemini-3-flash",
-            "free_model_step3": "gemini-3-flash",
+            "free_model_step3": "gemini-3.1-pro-preview",
             "paid_model_step1": "gemini-3-flash",
             "paid_model_step2": "gemini-3-flash",
-            "paid_model_step3": "gemini-3-flash",
-            "free_rpm": 12,
-            "paid_rpm": 300,
-            "free_threads": 1,
-            "paid_threads": 5,
+            "paid_model_step3": "gemini-3.1-pro-preview",
+            
+            "free_model_perf": self.default_free_perf.copy(),
+            "paid_model_perf": self.default_paid_perf.copy(),
+            
             "free_temp": 0.0,
             "paid_temp": 0.0,
             "free_safety": True,
@@ -116,32 +133,44 @@ class DrawingAnalysisApp(ctk.CTk):
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                     
-                    # 移行処理: 古い free_model / paid_model があれば各ステップにコピー
+                    # 古い単一モデル・スレッド設定の移行処理
                     for plan in ["free", "paid"]:
-                        old_key = f"{plan}_model"
-                        if old_key in loaded:
-                            old_val = loaded[old_key]
-                            # 1.5などは最新に変換
+                        old_model_key = f"{plan}_model"
+                        if old_model_key in loaded:
+                            old_val = loaded[old_model_key]
                             if "1.5" in old_val or "2.0" in old_val:
                                 old_val = "gemini-3-flash"
                             for step in ["step1", "step2", "step3"]:
                                 step_key = f"{plan}_model_{step}"
                                 if step_key not in loaded:
                                     loaded[step_key] = old_val
-                            del loaded[old_key] # 古いキーは削除
+                            del loaded[old_model_key]
                     
-                    # すでに step1~3 が存在する場合の 1.5 などの変換
+                    # 結合
+                    self.api_settings.update(loaded)
+                    
+                    # 移行: 古い rpm / threads キーのみの時代のデータならデフォルトモデルパフォーマンスを補完
+                    if "free_model_perf" not in loaded:
+                        self.api_settings["free_model_perf"] = self.default_free_perf.copy()
+                    if "paid_model_perf" not in loaded:
+                        self.api_settings["paid_model_perf"] = self.default_paid_perf.copy()
+
+                    # 古い構造の不要なキーを削除 (クリーンアップ)
+                    keys_to_delete = [k for k in self.api_settings.keys() if ("rpm" in k or "threads" in k) and k not in ["free_model_perf", "paid_model_perf"]]
+                    for k in keys_to_delete:
+                        del self.api_settings[k]
+
+                    # 1.5 などの古いモデルの強制変換
                     for plan in ["free", "paid"]:
                         for step in ["step1", "step2", "step3"]:
                             step_key = f"{plan}_model_{step}"
-                            if step_key in loaded and ("1.5" in loaded[step_key] or "2.0" in loaded[step_key]):
-                                loaded[step_key] = "gemini-3-flash"
+                            if step_key in self.api_settings and ("1.5" in self.api_settings[step_key] or "2.0" in self.api_settings[step_key]):
+                                self.api_settings[step_key] = "gemini-3-flash"
 
-                    if "models_list" in loaded:
-                        if any("1.5" in item[1] for item in loaded["models_list"]):
-                            del loaded["models_list"]
+                    if "models_list" in self.api_settings:
+                        if any("1.5" in item[1] for item in self.api_settings["models_list"]):
+                            del self.api_settings["models_list"]
                             
-                    self.api_settings.update(loaded)
             except Exception as e:
                 print(f"Load settings error: {e}")
 
@@ -312,7 +341,23 @@ class DrawingAnalysisApp(ctk.CTk):
             # 各ステップのモデルを取得
             model_name_step1 = self.api_settings.get(f"{prefix}model_step1", "gemini-3-flash")
             model_name_step2 = self.api_settings.get(f"{prefix}model_step2", "gemini-3-flash")
-            model_name_step3 = self.api_settings.get(f"{prefix}model_step3", "gemini-3-flash")
+            model_name_step3 = self.api_settings.get(f"{prefix}model_step3", "gemini-3.1-pro-preview")
+            
+            # モデル別パフォーマンス辞書を取得
+            model_perf_dict = self.api_settings.get(f"{prefix}model_perf", {})
+            
+            # RPM/スレッドを取得するヘルパー
+            def get_perf(m_id):
+                perf = model_perf_dict.get(m_id, {})
+                # 見つからなかった場合のフォールバックロジック
+                is_pro = "pro" in m_id.lower()
+                def_rpm = 2 if (is_pro and plan == "free") else (150 if is_pro else (15 if plan == "free" else 300))
+                def_thr = 1 if (is_pro and plan == "free") else (5 if is_pro else (1 if plan == "free" else 5))
+                return perf.get("rpm", def_rpm), perf.get("threads", def_thr)
+                
+            rpm_step1, threads_step1 = get_perf(model_name_step1)
+            rpm_step2, threads_step2 = get_perf(model_name_step2)
+            rpm_step3, threads_step3 = get_perf(model_name_step3)
             
             # 1. 画像とテキストデータの準備
             ext = os.path.splitext(self.selected_file_path)[1].lower()
@@ -383,8 +428,8 @@ class DrawingAnalysisApp(ctk.CTk):
                 **common_generation_config_args
             )
             
-            model_step1 = genai.GenerativeModel(model_name_step1)
-            response1 = model_step1.generate_content([step1_prompt, self.processed_image_pil], generation_config=step1_config, safety_settings=safety)
+            model_step1_instance = genai.GenerativeModel(model_name_step1)
+            response1 = model_step1_instance.generate_content([step1_prompt, self.processed_image_pil], generation_config=step1_config, safety_settings=safety)
             if not response1.candidates: raise Exception("ステップ1: AIからの応答が空でした。")
             
             part_list_data = self._parse_json_response(response1.text)
@@ -396,7 +441,7 @@ class DrawingAnalysisApp(ctk.CTk):
             # ==========================================
             # ステップ2: 個別部品の要素と寸法の抽出
             # ==========================================
-            model_step2 = genai.GenerativeModel(model_name_step2)
+            model_step2_instance = genai.GenerativeModel(model_name_step2)
             
             for idx, p_basic in enumerate(extracted_parts_basic):
                 p_name = p_basic.get("part_name", "不明")
@@ -428,7 +473,7 @@ class DrawingAnalysisApp(ctk.CTk):
                     **common_generation_config_args
                 )
                 
-                response2 = model_step2.generate_content([step2_prompt, self.processed_image_pil], generation_config=step2_config, safety_settings=safety)
+                response2 = model_step2_instance.generate_content([step2_prompt, self.processed_image_pil], generation_config=step2_config, safety_settings=safety)
                 
                 elements_data = self._parse_json_response(response2.text)
                 elements = elements_data.get('elements', []) if elements_data else []
@@ -474,8 +519,8 @@ class DrawingAnalysisApp(ctk.CTk):
                 **common_generation_config_args
             )
             
-            model_step3 = genai.GenerativeModel(model_name_step3)
-            response3 = model_step3.generate_content([step3_prompt, self.processed_image_pil], generation_config=step3_config, safety_settings=safety)
+            model_step3_instance = genai.GenerativeModel(model_name_step3)
+            response3 = model_step3_instance.generate_content([step3_prompt, self.processed_image_pil], generation_config=step3_config, safety_settings=safety)
             verification_data = self._parse_json_response(response3.text)
             
             if verification_data and 'missing_parts' in verification_data:

@@ -73,6 +73,18 @@ class APISettingsDialog(ctk.CTkToplevel):
         else:
             self.models_list = saved_list
 
+        # 各モデルの推奨制限を保持する辞書
+        self.model_limits = {}
+        for m_display, m_id in self.models_list:
+            is_pro = "pro" in m_id.lower()
+            self.model_limits[m_id] = {
+                "free_rpm": 2 if is_pro else 15,
+                "free_threads": 1,
+                "paid_rpm": 150 if is_pro else 300,
+                "paid_threads": 5,
+                "max_tokens": 8192
+            }
+
         # 変数の初期化
         self.plan_var = ctk.StringVar(value=self.settings.get("plan", "free"))
         
@@ -81,11 +93,10 @@ class APISettingsDialog(ctk.CTkToplevel):
                 "key": ctk.StringVar(value=self.settings.get("free_key", "")),
                 "model_step1": ctk.StringVar(value=self.settings.get("free_model_step1", "gemini-3-flash")),
                 "model_step2": ctk.StringVar(value=self.settings.get("free_model_step2", "gemini-3-flash")),
-                "model_step3": ctk.StringVar(value=self.settings.get("free_model_step3", "gemini-3-flash")),
-                "rpm": ctk.IntVar(value=self.settings.get("free_rpm", 15)),
-                "threads": ctk.IntVar(value=self.settings.get("free_threads", 1)),
+                "model_step3": ctk.StringVar(value=self.settings.get("free_model_step3", "gemini-3.1-pro-preview")),
+                "perf_vars": {}, # {model_id: {"rpm": IntVar, "threads": IntVar}} を格納
                 "temp": ctk.DoubleVar(value=self.settings.get("free_temp", 0.0)),
-                "tokens": ctk.IntVar(value=self.settings.get("free_tokens", 65535)), # MAX_TOKENSエラー回避のため、安全な上限65535に設定
+                "tokens": ctk.IntVar(value=self.settings.get("free_tokens", 65535)),
                 "safety": ctk.BooleanVar(value=self.settings.get("free_safety", True)),
                 "prompts": self.settings.get("free_prompts", [])
             },
@@ -93,11 +104,10 @@ class APISettingsDialog(ctk.CTkToplevel):
                 "key": ctk.StringVar(value=self.settings.get("paid_key", "")),
                 "model_step1": ctk.StringVar(value=self.settings.get("paid_model_step1", "gemini-3-flash")),
                 "model_step2": ctk.StringVar(value=self.settings.get("paid_model_step2", "gemini-3-flash")),
-                "model_step3": ctk.StringVar(value=self.settings.get("paid_model_step3", "gemini-3-flash")),
-                "rpm": ctk.IntVar(value=self.settings.get("paid_rpm", 300)),
-                "threads": ctk.IntVar(value=self.settings.get("paid_threads", 5)),
+                "model_step3": ctk.StringVar(value=self.settings.get("paid_model_step3", "gemini-3.1-pro-preview")),
+                "perf_vars": {},
                 "temp": ctk.DoubleVar(value=self.settings.get("paid_temp", 0.0)),
-                "tokens": ctk.IntVar(value=self.settings.get("paid_tokens", 65535)), # MAX_TOKENSエラー回避のため、安全な上限65535に設定
+                "tokens": ctk.IntVar(value=self.settings.get("paid_tokens", 65535)),
                 "safety": ctk.BooleanVar(value=self.settings.get("paid_safety", True)),
                 "prompts": self.settings.get("paid_prompts", [])
             }
@@ -105,7 +115,8 @@ class APISettingsDialog(ctk.CTkToplevel):
         
         self.saved_prompts = self.settings.get("saved_prompts", [])
         self.fav_lists = []
-        self.model_combos_by_plan = [] # 各プランごとのコンボボックス(step1,2,3)を保持
+        self.tab_controls = [] # 各タブのコンボボックスと再描画関数を保持
+        self.perf_render_funcs = [] # モデル更新時に各タブのスクロールUIを再描画するため
 
         self._setup_ui()
 
@@ -190,17 +201,14 @@ class APISettingsDialog(ctk.CTkToplevel):
                 messagebox.showwarning("警告", "APIキーが入力されていません。", parent=self)
                 return
                 
-            # コンボボックスの表示からIDを直接取得してテストに用いる
             current_display = cb.get()
             model_name = next((m[1] for m in self.models_list if m[0] == current_display), current_display)
-            
             btn.configure(state="disabled", text="通信中...")
 
             def run_test():
                 try:
                     genai.configure(api_key=key)
                     model = genai.GenerativeModel(model_name)
-                    # キャッシュ回避のためタイムスタンプを送信
                     model.generate_content(f"Connection Test: {time.time()}")
                     self.after(0, lambda: messagebox.showinfo("テスト成功", f"APIキーは正しく認識されました。\nモデル「{model_name}」による通信は正常です！", parent=self))
                 except Exception as e:
@@ -210,18 +218,18 @@ class APISettingsDialog(ctk.CTkToplevel):
 
             threading.Thread(target=run_test, daemon=True).start()
 
-        # --- 中間コンテナ（モデル・パラメータ） ---
-        middle_frame = ctk.CTkFrame(parent_tab, fg_color="transparent")
-        middle_frame.pack(fill="x", padx=10, pady=5)
-        middle_frame.grid_columnconfigure(0, weight=3)
-        middle_frame.grid_columnconfigure(1, weight=2)
+        # --- 中間コンテナ上部（左右分割） ---
+        middle_top_frame = ctk.CTkFrame(parent_tab, fg_color="transparent")
+        middle_top_frame.pack(fill="x", padx=10, pady=5)
+        middle_top_frame.grid_columnconfigure(0, weight=3)
+        middle_top_frame.grid_columnconfigure(1, weight=2)
 
-        # --- ② モデル・パフォーマンス設定 ---
-        perf_frame = ctk.CTkFrame(middle_frame, corner_radius=8, border_width=1, border_color="gray70")
-        perf_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-        ctk.CTkLabel(perf_frame, text=" ② モデル・パフォーマンス設定 ", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(5, 0))
+        # --- ② モデル設定 (左側) ---
+        model_frame = ctk.CTkFrame(middle_top_frame, corner_radius=8, border_width=1, border_color="gray70")
+        model_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        ctk.CTkLabel(model_frame, text=" ② 使用モデル設定 (ステップ別) ", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(5, 0))
         
-        model_inner = ctk.CTkFrame(perf_frame, fg_color="transparent")
+        model_inner = ctk.CTkFrame(model_frame, fg_color="transparent")
         model_inner.pack(fill="x", padx=10, pady=(5, 2))
         
         current_plan_combos = []
@@ -233,12 +241,12 @@ class APISettingsDialog(ctk.CTkToplevel):
             step_frame = ctk.CTkFrame(model_inner, fg_color="transparent")
             step_frame.pack(fill="x", pady=2)
             
-            ctk.CTkLabel(step_frame, text=label_text, font=ctk.CTkFont(weight="bold"), width=120, anchor="w").pack(side="left")
+            ctk.CTkLabel(step_frame, text=label_text, font=ctk.CTkFont(weight="bold"), width=110, anchor="w").pack(side="left")
             
             cb = ctk.CTkComboBox(step_frame, values=display_names)
             cb.pack(side="left", fill="x", expand=True, padx=(0, 5))
             
-            btn_test = ctk.CTkButton(step_frame, text="テスト", width=50)
+            btn_test = ctk.CTkButton(step_frame, text="テスト", width=40)
             btn_test.configure(command=lambda k=vars_dict["key"], c=cb, b=btn_test: test_key(k, c, b))
             btn_test.pack(side="left")
             
@@ -246,27 +254,10 @@ class APISettingsDialog(ctk.CTkToplevel):
             matched_display = next((m[0] for m in self.models_list if m[1] == curr_id), curr_id)
             cb.set(matched_display)
             
-            # Step2 のコンボボックス変更時にのみ RPM と スレッド数を推奨値にセット
-            if i == 1:
-                def on_model_select(choice, c=cb, r_var=vars_dict["rpm"], t_var=vars_dict["threads"], is_f=is_free):
-                    matched_id = next((m[1] for m in self.models_list if m[0] == choice), choice)
-                    if "pro" in matched_id.lower():
-                        if is_f: r_var.set(2); t_var.set(1)
-                        else: r_var.set(150); t_var.set(5)
-                    else:
-                        if is_f: r_var.set(15); t_var.set(1)
-                        else: r_var.set(300); t_var.set(5)
-                cb.configure(command=on_model_select)
-            else:
-                cb.configure(command=lambda choice: None)
-                
             current_plan_combos.append(cb)
             
-        self.model_combos_by_plan.append(current_plan_combos)
-        
-        # 🌐 更新ボタン と 🔗 公式リンク
-        action_inner = ctk.CTkFrame(perf_frame, fg_color="transparent")
-        action_inner.pack(fill="x", padx=10, pady=(5, 5))
+        action_inner = ctk.CTkFrame(model_frame, fg_color="transparent")
+        action_inner.pack(fill="x", padx=10, pady=(10, 5))
         
         def fetch_models(k_var=vars_dict["key"], btn=None):
             key = k_var.get().strip()
@@ -279,17 +270,37 @@ class APISettingsDialog(ctk.CTkToplevel):
                 try:
                     genai.configure(api_key=key)
                     new_models = []
+                    max_out_tokens = 8192
+                    
                     for m in genai.list_models():
                         if "generateContent" in getattr(m, "supported_generation_methods", []) and "gemini" in m.name.lower():
                             name = m.name.replace("models/", "")
                             if not any(k in name.lower() for k in ["tts", "audio", "image", "vision", "embedding"]):
                                 new_models.append((f"{m.display_name} ({name})", name))
+                                
+                                # トークンと制限を調べる
+                                out_tokens = getattr(m, "output_token_limit", 8192)
+                                if out_tokens > max_out_tokens:
+                                    max_out_tokens = out_tokens
+                                    
+                                is_pro = "pro" in name.lower()
+                                self.model_limits[name] = {
+                                    "free_rpm": 2 if is_pro else 15,
+                                    "free_threads": 1,
+                                    "paid_rpm": 150 if is_pro else 300,
+                                    "paid_threads": 5,
+                                    "max_tokens": out_tokens
+                                }
                             
                     if new_models:
                         self.models_list.clear()
                         self.models_list.extend(new_models)
-                        self.after(0, lambda: update_combos())
-                        self.after(0, lambda: messagebox.showinfo("更新完了", f"最新のモデルリスト ({len(self.models_list)}件) を取得しました！\nコンボボックスの選択肢が更新されました。", parent=self))
+                        
+                        # 安全なトークン上限 (最大65535) にクリップ
+                        safe_tokens = min(max_out_tokens, 65535)
+                        
+                        self.after(0, lambda: update_ui_after_fetch(safe_tokens))
+                        self.after(0, lambda: messagebox.showinfo("更新完了", f"最新のモデルリスト ({len(self.models_list)}件) とAPI制限を取得し適用しました！\n選択肢と最大トークンが更新されました。", parent=self))
                     else:
                         self.after(0, lambda: messagebox.showinfo("情報", "取得可能なモデルが見つかりませんでした。", parent=self))
                 except Exception as e:
@@ -297,18 +308,23 @@ class APISettingsDialog(ctk.CTkToplevel):
                 finally:
                     self.after(0, lambda: btn.configure(text="🌐 モデルリスト更新", state="normal"))
 
-            def update_combos():
+            def update_ui_after_fetch(new_tokens):
                 display_names_updated = [m[0] for m in self.models_list]
-                for plan_key, combos in zip(["free", "paid"], self.model_combos_by_plan):
-                    v = self.vars[plan_key]
-                    v_keys = ["model_step1", "model_step2", "model_step3"]
-                    for cb, v_key in zip(combos, v_keys):
+                for controls in self.tab_controls:
+                    cbs = controls["model_combos"]
+                    for cb in cbs:
+                        current_val = cb.get()
                         cb.configure(values=display_names_updated)
-                        curr_id = v[v_key].get()
-                        for m in self.models_list:
-                            if m[1] == curr_id:
-                                cb.set(m[0])
-                                break
+                        # 可能であれば元の選択を維持
+                        cb.set(current_val)
+                
+                # 取得した最大トークンを無料枠・課金枠の両方に適用
+                self.vars["free"]["tokens"].set(new_tokens)
+                self.vars["paid"]["tokens"].set(new_tokens)
+                
+                # 両方のタブのパフォーマンス設定表示を再描画
+                for render_func in self.perf_render_funcs:
+                    render_func()
 
             threading.Thread(target=do_fetch, daemon=True).start()
 
@@ -320,41 +336,14 @@ class APISettingsDialog(ctk.CTkToplevel):
         lbl_link.pack(side="right")
         lbl_link.bind("<Button-1>", lambda e: webbrowser.open_new("https://ai.google.dev/gemini-api/docs/models/gemini"))
 
-        # RPM / スレッド
-        speed_inner = ctk.CTkFrame(perf_frame, fg_color="transparent")
-        speed_inner.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(speed_inner, text="RPM:", font=ctk.CTkFont(weight="bold")).pack(side="left")
-        ctk.CTkEntry(speed_inner, textvariable=vars_dict["rpm"], width=60).pack(side="left", padx=(5, 15))
-        ctk.CTkLabel(speed_inner, text="スレッド:", font=ctk.CTkFont(weight="bold")).pack(side="left")
-        ctk.CTkEntry(speed_inner, textvariable=vars_dict["threads"], width=60).pack(side="left", padx=(5, 0))
 
-        # ℹ️ 制限と仕様を確認 / 🔄 推奨値 ボタン群
-        perf_action_inner = ctk.CTkFrame(perf_frame, fg_color="transparent")
-        perf_action_inner.pack(fill="x", padx=10, pady=(10, 10))
-        
-        btn_show_limit = ctk.CTkButton(perf_action_inner, text="ℹ️ 制限と仕様を確認", fg_color="gray", hover_color="darkgray", 
-                                       command=lambda cbs=current_plan_combos, f=is_free: self.show_limit_info(cbs, f))
-        btn_show_limit.pack(side="left")
-
-        def reset_perf(cbs=current_plan_combos, r_var=vars_dict["rpm"], t_var=vars_dict["threads"], is_f=is_free):
-            target_model_val = "gemini-3-flash"
-            target_display = next((m[0] for m in self.models_list if m[1] == target_model_val), target_model_val)
-            for cb in cbs:
-                cb.set(target_display)
-            if is_f: r_var.set(15); t_var.set(1) 
-            else: r_var.set(300); t_var.set(5) 
-                    
-        btn_reset_perf = ctk.CTkButton(perf_action_inner, text="🔄 推奨値", width=80, 
-                                       command=lambda cbs=current_plan_combos, r=vars_dict["rpm"], t=vars_dict["threads"], f=is_free: reset_perf(cbs, r, t, f))
-        btn_reset_perf.pack(side="right")
-
-        # --- ③ AI抽出パラメータ設定 ---
-        param_frame = ctk.CTkFrame(middle_frame, corner_radius=8, border_width=1, border_color="gray70")
+        # --- ③ AI抽出パラメータ設定 (右側) ---
+        param_frame = ctk.CTkFrame(middle_top_frame, corner_radius=8, border_width=1, border_color="gray70")
         param_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
         ctk.CTkLabel(param_frame, text=" ③ AI抽出パラメータ設定 ", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(5, 0))
         
         param_row1 = ctk.CTkFrame(param_frame, fg_color="transparent")
-        param_row1.pack(fill="x", padx=10, pady=5)
+        param_row1.pack(fill="x", padx=10, pady=(15, 5))
         ctk.CTkLabel(param_row1, text="Temp:", font=ctk.CTkFont(weight="bold")).pack(side="left")
         ctk.CTkEntry(param_row1, textvariable=vars_dict["temp"], width=50).pack(side="left", padx=(5, 15))
         ctk.CTkLabel(param_row1, text="最大トークン:", font=ctk.CTkFont(weight="bold")).pack(side="left")
@@ -364,21 +353,96 @@ class APISettingsDialog(ctk.CTkToplevel):
         param_row2.pack(fill="x", padx=10, pady=5)
         ctk.CTkCheckBox(param_row2, text="安全フィルタ無効化", variable=vars_dict["safety"]).pack(side="left")
 
-        # 🔄 推奨値 ボタン
         def reset_param(t_var=vars_dict["temp"], tok_var=vars_dict["tokens"], s_var=vars_dict["safety"]):
             t_var.set(0.0)
-            tok_var.set(65535) # MAX_TOKENS対策として、安全な上限値65535を推奨値に設定
+            tok_var.set(65535)
             s_var.set(True)
             
         btn_reset_param = ctk.CTkButton(param_row2, text="🔄 推奨値", width=80, 
                                         command=lambda t=vars_dict["temp"], tok=vars_dict["tokens"], s=vars_dict["safety"]: reset_param(t, tok, s))
-        btn_reset_param.pack(side="right", pady=(10, 0))
+        btn_reset_param.pack(side="right", pady=(15, 0))
 
 
-        # --- ④ カスタムプロンプト ---
+        # --- ④ パフォーマンス設定（横幅いっぱい） ---
+        perf_container = ctk.CTkFrame(parent_tab, corner_radius=8, border_width=1, border_color="gray70")
+        perf_container.pack(fill="x", padx=10, pady=(5, 5))
+        ctk.CTkLabel(perf_container, text=" ④ パフォーマンス設定 (モデル別 API制限) ", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(5, 0))
+
+        # スクロールエリアを廃止し、すべて展開表示される通常のFrameに変更
+        perf_list_frame = ctk.CTkFrame(perf_container, fg_color="transparent")
+        perf_list_frame.pack(fill="x", padx=10, pady=5)
+        
+        vars_dict["perf_vars"] = {} # {model_id: {"rpm": IntVar, "threads": IntVar}}
+        
+        def render_perf_settings():
+            for widget in perf_list_frame.winfo_children():
+                widget.destroy()
+                
+            model_perf_data = self.settings.get(f"{plan_type}_model_perf", {})
+            
+            for m_display, m_id in self.models_list:
+                row_frame = ctk.CTkFrame(perf_list_frame, fg_color="transparent")
+                row_frame.pack(fill="x", pady=2)
+                
+                # ラベル幅を固定して整列
+                ctk.CTkLabel(row_frame, text=m_display, anchor="w", width=250).pack(side="left", padx=(0, 10))
+                
+                # IntVarの初期化 (既存の値があれば引き継ぐ)
+                if m_id not in vars_dict["perf_vars"]:
+                    saved_perf = model_perf_data.get(m_id)
+                    if saved_perf:
+                        def_rpm = saved_perf.get("rpm")
+                        def_thr = saved_perf.get("threads")
+                    else:
+                        # 内部辞書（API制限）からデフォルトを適用
+                        limits = self.model_limits.get(m_id, {})
+                        def_rpm = limits.get("free_rpm" if is_free else "paid_rpm", 2 if "pro" in m_id.lower() and is_free else (150 if "pro" in m_id.lower() else (15 if is_free else 300)))
+                        def_thr = limits.get("free_threads" if is_free else "paid_threads", 1 if "pro" in m_id.lower() and is_free else (5 if "pro" in m_id.lower() else (1 if is_free else 5)))
+                    
+                    vars_dict["perf_vars"][m_id] = {
+                        "rpm": ctk.IntVar(value=def_rpm),
+                        "threads": ctk.IntVar(value=def_thr)
+                    }
+                
+                rpm_var = vars_dict["perf_vars"][m_id]["rpm"]
+                thr_var = vars_dict["perf_vars"][m_id]["threads"]
+                
+                ctk.CTkLabel(row_frame, text="RPM:", font=ctk.CTkFont(size=11)).pack(side="left")
+                ctk.CTkEntry(row_frame, textvariable=rpm_var, width=50).pack(side="left", padx=(2, 20))
+                
+                ctk.CTkLabel(row_frame, text="スレッド:", font=ctk.CTkFont(size=11)).pack(side="left")
+                ctk.CTkEntry(row_frame, textvariable=thr_var, width=50).pack(side="left", padx=(2, 0))
+
+        render_perf_settings()
+        self.perf_render_funcs.append(render_perf_settings)
+
+        perf_action_inner = ctk.CTkFrame(perf_container, fg_color="transparent")
+        perf_action_inner.pack(fill="x", padx=10, pady=(5, 10))
+        
+        btn_show_limit = ctk.CTkButton(perf_action_inner, text="ℹ️ 制限と仕様を確認", fg_color="gray", hover_color="darkgray", 
+                                       command=lambda f=is_free: self.show_limit_info(f))
+        btn_show_limit.pack(side="left")
+
+        def reset_perf():
+            for m_id, p_vars in vars_dict["perf_vars"].items():
+                limits = self.model_limits.get(m_id, {})
+                def_rpm = limits.get("free_rpm" if is_free else "paid_rpm", 2 if "pro" in m_id.lower() and is_free else (150 if "pro" in m_id.lower() else (15 if is_free else 300)))
+                def_thr = limits.get("free_threads" if is_free else "paid_threads", 1 if "pro" in m_id.lower() and is_free else (5 if "pro" in m_id.lower() else (1 if is_free else 5)))
+                
+                p_vars["rpm"].set(def_rpm)
+                p_vars["threads"].set(def_thr)
+                    
+        btn_reset_perf = ctk.CTkButton(perf_action_inner, text="🔄 パフォーマンスの推奨値セット", width=80, 
+                                       command=reset_perf)
+        btn_reset_perf.pack(side="right")
+        
+        self.tab_controls.append({"model_combos": current_plan_combos})
+
+
+        # --- ⑤ カスタムプロンプト ---
         prompt_frame = ctk.CTkFrame(parent_tab, corner_radius=8, border_width=1, border_color="gray70")
         prompt_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        ctk.CTkLabel(prompt_frame, text=" ④ 独自の追加指示 (カスタムプロンプト) ", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(5, 0))
+        ctk.CTkLabel(prompt_frame, text=" ⑤ 独自の追加指示 (カスタムプロンプト) ", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(5, 0))
 
         input_inner = ctk.CTkFrame(prompt_frame, fg_color="transparent")
         input_inner.pack(fill="x", padx=10, pady=(5, 10))
@@ -413,7 +477,6 @@ class APISettingsDialog(ctk.CTkToplevel):
         right_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
         fav_list = CTkScrollableCheckboxList(right_frame, height=120, border_width=1)
         fav_list.pack(fill="both", expand=True, pady=5)
-        self.fav_lists.append(fav_list)
 
         def add_fav_to_current():
             for text in fav_list.get_selected_items():
@@ -430,7 +493,7 @@ class APISettingsDialog(ctk.CTkToplevel):
             f_list.set_items(self.saved_prompts)
 
     # ℹ️ 制限と仕様を確認用のダイアログ表示
-    def show_limit_info(self, cbs, is_f):
+    def show_limit_info(self, is_f):
         info_win = ctk.CTkToplevel(self)
         info_win.title("Gemini API 制限と仕様一覧")
         info_win.geometry("950x700")
@@ -520,12 +583,7 @@ class APISettingsDialog(ctk.CTkToplevel):
         create_table(scroll, headers_model, data_model, [2, 2, 3, 3])
 
         current_plan = "無料枠 (Free Tier)" if is_f else "課金枠 (Paid Tier)"
-        current_display_1 = cbs[0].get()
-        current_display_2 = cbs[1].get()
-        current_display_3 = cbs[2].get()
-        
-        status_text = f"【現在、このタブで選択中の設定】\nプラン: {current_plan}\nStep1: {current_display_1} \nStep2: {current_display_2} \nStep3: {current_display_3}"
-        ctk.CTkLabel(scroll, text=status_text, font=ctk.CTkFont(weight="bold"), text_color="#0D6EFD", 
+        ctk.CTkLabel(scroll, text=f"【現在表示中のプラン情報】\n{current_plan}", font=ctk.CTkFont(weight="bold"), text_color="#0D6EFD", 
                      fg_color="gray80", corner_radius=8, padx=10, pady=10).pack(fill="x", padx=10, pady=15)
                      
         ctk.CTkButton(scroll, text="閉じる", command=info_win.destroy, width=150, fg_color="gray").pack(pady=(0, 20))
@@ -534,21 +592,31 @@ class APISettingsDialog(ctk.CTkToplevel):
     def save_and_close(self):
         new_settings = {
             "plan": self.plan_var.get(),
-            "models_list": self.models_list, # 更新されたモデルリストも保存
+            "models_list": self.models_list,
             "saved_prompts": self.saved_prompts,
         }
-        # コンボボックスに表示されている文字列から直接IDを取得して保存する（確実な反映）
-        for plan_type, cbs in zip(["free", "paid"], self.model_combos_by_plan):
+        
+        # 保存時に現在の情報を取得
+        for plan_type, controls in zip(["free", "paid"], self.tab_controls):
             v = self.vars[plan_type]
+            cbs = controls["model_combos"]
             
+            # Step1~3 のモデル割り当て
             for step_idx, step_name in enumerate(["step1", "step2", "step3"]):
                 current_display = cbs[step_idx].get()
                 matched_id = next((m[1] for m in self.models_list if m[0] == current_display), current_display)
                 new_settings[f"{plan_type}_model_{step_name}"] = matched_id
+                
+            # モデルごとのパフォーマンス (RPM/Threads) を辞書化して保存
+            model_perf_dict = {}
+            for m_id, p_vars in v["perf_vars"].items():
+                model_perf_dict[m_id] = {
+                    "rpm": p_vars["rpm"].get(),
+                    "threads": p_vars["threads"].get()
+                }
+            new_settings[f"{plan_type}_model_perf"] = model_perf_dict
             
             new_settings[f"{plan_type}_key"] = v["key"].get().strip()
-            new_settings[f"{plan_type}_rpm"] = v["rpm"].get()
-            new_settings[f"{plan_type}_threads"] = v["threads"].get()
             new_settings[f"{plan_type}_temp"] = v["temp"].get()
             new_settings[f"{plan_type}_tokens"] = v["tokens"].get()
             new_settings[f"{plan_type}_safety"] = v["safety"].get()
