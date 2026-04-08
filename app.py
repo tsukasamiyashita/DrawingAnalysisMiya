@@ -9,6 +9,8 @@ import io
 import os
 import json
 import threading
+import concurrent.futures
+import time
 from pydantic import BaseModel, Field
 from typing import List
 import google.generativeai as genai
@@ -25,10 +27,10 @@ SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 # --- 構造化データ（Structured Output）のスキーマ定義 (マルチターン用) ---
 
 class Element(BaseModel):
-    element_name: str = Field(description="構成要素の名称（例: ベースプレート、リブ、ボス、本体）")
-    dimensions: str = Field(description="図面から直接読み取った寸法の文字列。絶対に空欄にせず、図面の表記をそのまま抽出すること（例: 150x100xt10, Φ50xL200）")
-    calculation_formula: str = Field(description="体積(mm³)を導き出すための『純粋な数式のみ』。文字や単位を含めず、Pythonのeval関数で計算可能な文字列にすること。例: '150 * 100 * 10' または '(50/2)**2 * 3.14159 * 200'")
-    notes: str = Field(description="特記事項がない場合は必ず空文字にすること。記述する場合も極力短く（10文字以内）し、出力トークンを節約すること。")
+    element_name: str = Field(description="構成要素の名称（例: ベースプレート、リブ、ボス、貫通穴）")
+    dimensions: str = Field(description="三面図（正面図、平面図、側面図など）の各投影ビューから読み取った寸法の統合情報。絶対に空欄にせず、立体の幅・高さ・奥行きがどう定義されているか記載すること（例: 正面図W150xH100, 平面図D10）")
+    calculation_formula: str = Field(description="三面図から復元した3次元形状に基づく、体積(mm³)を導き出すための『純粋な数式のみ』。文字や単位を含めず、Pythonのeval関数で計算可能な文字列にすること。穴などの空間は必ずマイナス（引き算）として式に組み込むこと。例: '150 * 100 * 10' または '-(50/2)**2 * 3.14159 * 10'")
+    notes: str = Field(description="三面図から立体形状をどう解釈したか等の特記事項がない場合は必ず空文字にすること。記述する場合も極力短く（15文字以内）し、出力トークンを節約すること。")
 
 # ステップ1用: 部品の基本情報のみ
 class PartBasic(BaseModel):
@@ -366,21 +368,44 @@ class DrawingAnalysisApp(ctk.CTk):
             if ext == '.pdf':
                 doc = fitz.open(self.selected_file_path)
                 page = doc.load_page(0)
-                pix = page.get_pixmap(dpi=400)
+                pix = page.get_pixmap(dpi=400) # 高解像度でレンダリング
                 raw_image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
                 
-                self.update_status("ベクターデータを解析中...")
+                # Visual Grounding 用にOpenCV形式へ変換
+                annotated_img_cv = cv2.cvtColor(np.array(raw_image), cv2.COLOR_RGB2BGR)
+                scale_factor = 400 / 72.0 # pdfplumberのデフォルト(72dpi)からのスケール変換
+                
+                self.update_status("ベクターデータを解析・グラウンディング画像生成中...")
                 text_data_list = []
                 with pdfplumber.open(self.selected_file_path) as pdf:
                     p0 = pdf.pages[0]
                     words = p0.extract_words()
-                    for w in words:
-                        text_data_list.append(f"[X:{w['x0']:.1f}, Y:{w['top']:.1f}] {w['text']}")
-                text_pdf = "\n".join(text_data_list)
-            else:
-                raw_image = Image.open(self.selected_file_path).convert("RGB")
+                    
+                    for idx, w in enumerate(words):
+                        text = w['text']
+                        # ID付きのテキストデータリストを作成
+                        text_data_list.append(f"[ID:{idx}] X:{w['x0']:.1f}, Y:{w['top']:.1f} TEXT: {text}")
+                        
+                        # 画像にバウンディングボックスとIDを描画
+                        x0 = int(w['x0'] * scale_factor)
+                        y0 = int(w['top'] * scale_factor)
+                        x1 = int(w['x1'] * scale_factor)
+                        y1 = int(w['bottom'] * scale_factor)
+                        
+                        # 赤枠
+                        cv2.rectangle(annotated_img_cv, (x0, y0), (x1, y1), (0, 0, 255), 2)
+                        # 青文字ID
+                        cv2.putText(annotated_img_cv, str(idx), (x0, max(0, y0 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
 
-            self.processed_image_pil = raw_image
+                text_pdf = "\n".join(text_data_list)
+                
+                # アノテーション済みの画像をPillow形式に戻してAIへ渡す
+                self.processed_image_pil = Image.fromarray(cv2.cvtColor(annotated_img_cv, cv2.COLOR_BGR2RGB))
+            else:
+                # 画像ファイルの場合のフォールバック
+                raw_image = Image.open(self.selected_file_path).convert("RGB")
+                self.processed_image_pil = raw_image
+
             self.update_preview(self.processed_image_pil)
 
             genai.configure(api_key=api_key)
@@ -412,11 +437,13 @@ class DrawingAnalysisApp(ctk.CTk):
             提供された図面画像とテキストデータから、「部品の一覧」のみをすべて抽出してください。
             ここでは各部品の寸法や要素の詳細は不要です。品番、品名、材質、比重のみを特定してください。
             
-            【前提条件】
+            【重要な前提条件（Visual Grounding）】
+            - 画像には、テキストが抽出された正確な位置を示す「赤い枠」と「青い文字のID番号」が描画されています。
+            - 以下のテキストデータ（[ID:〇〇] X座標, Y座標 TEXT: 文字列）は、画像上の青いID番号と完全にリンクしています。
+            - 単純な文字の羅列ではなく、画像の「視覚的なレイアウト（表の構造や枠線）」と「テキストデータのID」を必ず照らし合わせて、正確に意味を読み取ってください。
             - デフォルト比重: {density} g/cm³ （材質記載がない場合に適用）
-            - テキストデータは絶対的な正解として扱ってください。
             
-            テキストデータ（[X座標, Y座標] 文字列）:
+            テキストデータ:
             {text_pdf}
             
             ユーザーからの追加指示: {custom_prompts}
@@ -439,27 +466,36 @@ class DrawingAnalysisApp(ctk.CTk):
             final_parts = []
 
             # ==========================================
-            # ステップ2: 個別部品の要素と寸法の抽出
+            # ステップ2: 個別部品の要素と寸法の抽出 (三面図解析 / マルチスレッド処理)
             # ==========================================
             model_step2_instance = genai.GenerativeModel(model_name_step2)
             
-            for idx, p_basic in enumerate(extracted_parts_basic):
+            def process_part(idx, p_basic):
                 p_name = p_basic.get("part_name", "不明")
                 p_num = p_basic.get("part_number", "")
-                self.update_status(f"ステップ2: 部品詳細を抽出中... ({idx+1}/{len(extracted_parts_basic)}) {p_name} ({model_name_step2})")
+                self.update_status(f"ステップ2: 部品詳細(三面図)を並列解析中... ({idx+1}/{len(extracted_parts_basic)}) {p_name}")
                 
                 step2_prompt = f"""
                 あなたは機械図面の解析エキスパートです。
-                提供された図面画像とテキストデータから、指定された特定の部品の「構成要素」と「寸法」を漏れなく抽出し、体積計算式を作成してください。
+                提供された図面画像とテキストデータから、指定された特定の部品の「構成要素」と「三面図から導き出される3次元寸法」を漏れなく抽出し、体積計算式を作成してください。
                 
                 【対象部品】
                 品番: {p_num}
                 品名: {p_name}
                 
-                【作業手順】
-                対象部品を構成する要素に分解し、テキストデータから該当する「寸法」を漏れなく読み取る。
-                「calculation_formula」に、読み取った寸法から体積(mm³)を導き出す純粋な計算式を記述する。
-                （例: 直方体なら "150 * 100 * 10"、円柱なら "(50/2)**2 * 3.14159 * 200"）
+                【作業手順 (三面図からの3D形状復元と線種の解析)】
+                1. 対象部品を構成する要素（本体ベース、リブ、ボス、貫通穴など）に分解する。
+                2. 図面の「線種」を正確に識別し、以下のように立体形状の解釈に反映させること。
+                   - 実線（太線）: 見える外形線（部材の実際の外形）
+                   - 破線: 隠れ線（内部の空洞、裏側の形状など。マイナス計算の強い根拠となる）
+                   - 一点鎖線: 中心線、対称軸、ピッチ線（円柱や穴の中心を示す）
+                   - 二点鎖線: 想像線、隣接部品、可動部の移動限界など（体積計算の対象外とする）
+                3. 図面が「三面図（正面図、平面図、側面図など）」で描かれていることを前提とし、各投影図をまたいで寸法情報を統合する。
+                   （例：正面図から「幅」と「高さ」を読み取り、平面図または側面図から「奥行き・厚み」を読み取って、頭の中で立体形状を復元する）
+                4. 画像の「赤い枠と青いID番号」と、テキストデータのIDを照合し、他の部品の寸法を誤って拾わないように厳密に注意すること。
+                5. 「calculation_formula」に、三面図から復元した寸法に基づく体積(mm³)を導き出す純粋な計算式を記述する。
+                   ドリル穴、ザグリ、切り欠きなどの「空間（除去される部分）」は、必ずマイナス（引き算）として式を構築すること。
+                   （例: 直方体ベースから円柱穴を引くなら "150 * 100 * 10 - (10/2)**2 * 3.14159 * 10"）
                 
                 テキストデータ:
                 {text_pdf}
@@ -473,10 +509,23 @@ class DrawingAnalysisApp(ctk.CTk):
                     **common_generation_config_args
                 )
                 
-                response2 = model_step2_instance.generate_content([step2_prompt, self.processed_image_pil], generation_config=step2_config, safety_settings=safety)
+                # 自動リトライ機能（通信集中による429エラー等を防止）
+                max_retries = 3
+                response2 = None
+                for attempt in range(max_retries):
+                    try:
+                        response2 = model_step2_instance.generate_content([step2_prompt, self.processed_image_pil], generation_config=step2_config, safety_settings=safety)
+                        break
+                    except Exception as e:
+                        if attempt == max_retries - 1:
+                            print(f"API Error on part {p_name}: {e}")
+                            break
+                        time.sleep((2 ** attempt) + 1) # 指数バックオフによる待機
                 
-                elements_data = self._parse_json_response(response2.text)
-                elements = elements_data.get('elements', []) if elements_data else []
+                elements = []
+                if response2:
+                    elements_data = self._parse_json_response(response2.text)
+                    elements = elements_data.get('elements', []) if elements_data else []
                 
                 complete_part = {
                     "part_number": p_basic.get("part_number", ""),
@@ -485,12 +534,24 @@ class DrawingAnalysisApp(ctk.CTk):
                     "density_g_cm3": p_basic.get("density_g_cm3", 0.0),
                     "elements": elements
                 }
-                final_parts.append(complete_part)
+                return complete_part
+
+            # 設定から取得したスレッド数を利用して並列実行
+            max_workers = threads_step2 if threads_step2 > 0 else 1
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 順序を維持するために、submitした順番のリストを作成して順番に処理を待つ
+                futures = [executor.submit(process_part, idx, p) for idx, p in enumerate(extracted_parts_basic)]
+                for future in futures:
+                    try:
+                        result = future.result()
+                        final_parts.append(result)
+                    except Exception as e:
+                        print(f"Thread execution error: {e}")
 
             # ==========================================
             # ステップ3: 最終検証 (抽出漏れの確認)
             # ==========================================
-            self.update_status(f"ステップ3: 抽出漏れがないか図面を再検証中 ({model_name_step3})...")
+            self.update_status(f"ステップ3: 三面図からの抽出漏れがないか再検証中 ({model_name_step3})...")
             
             extracted_summary = "\n".join([f"- 品番:{p['part_number']} 品名:{p['part_name']}" for p in final_parts])
             
@@ -501,11 +562,13 @@ class DrawingAnalysisApp(ctk.CTk):
             【すでに抽出済みの部品リスト】
             {extracted_summary}
             
-            もし見落としている部品があれば、その部品情報（品番、品名、材質、比重）と、その構成要素（寸法、計算式等）を全て抽出して出力してください。
+            もし見落としている部品があれば、その部品情報（品番、品名、材質、比重）と、その構成要素（寸法、計算式等）を三面図解釈ルールに従って全て抽出して出力してください。
+            画像の「青いID番号」とテキストを照らし合わせ、未処理の重要な情報ブロックが残っていないか確認してください。
             見落としが一つも無い場合（完璧な場合）は、「missing_parts」を空のリスト（[]）として返却してください。
             
-            【前提条件】
+            【前提条件・製図ルール】
             - デフォルト比重: {density} g/cm³ （材質記載がない場合に適用）
+            - 線種の識別: 実線(外形)、破線(隠れ線/内部空間)、一点鎖線(中心軸)、二点鎖線(計算除外)を厳密に区別して解釈に反映すること。
             
             テキストデータ:
             {text_pdf}
