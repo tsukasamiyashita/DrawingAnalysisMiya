@@ -1,3 +1,5 @@
+# tsukasamiyashita/drawinganalysismiya/DrawingAnalysisMiya-7a8c98c6b6e1070e1b40a113c814d8bf4b155a01/settings_dialog.py
+
 import customtkinter as ctk
 from tkinter import messagebox
 import threading
@@ -315,7 +317,6 @@ class APISettingsDialog(ctk.CTkToplevel):
                     for cb in cbs:
                         current_val = cb.get()
                         cb.configure(values=display_names_updated)
-                        # 可能であれば元の選択を維持
                         cb.set(current_val)
                 
                 # 取得した最大トークンを無料枠・課金枠の両方に適用
@@ -368,7 +369,6 @@ class APISettingsDialog(ctk.CTkToplevel):
         perf_container.pack(fill="x", padx=10, pady=(5, 5))
         ctk.CTkLabel(perf_container, text=" ④ パフォーマンス設定 (モデル別 API制限) ", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(5, 0))
 
-        # スクロールエリアを廃止し、すべて展開表示される通常のFrameに変更
         perf_list_frame = ctk.CTkFrame(perf_container, fg_color="transparent")
         perf_list_frame.pack(fill="x", padx=10, pady=5)
         
@@ -384,17 +384,14 @@ class APISettingsDialog(ctk.CTkToplevel):
                 row_frame = ctk.CTkFrame(perf_list_frame, fg_color="transparent")
                 row_frame.pack(fill="x", pady=2)
                 
-                # ラベル幅を固定して整列
                 ctk.CTkLabel(row_frame, text=m_display, anchor="w", width=250).pack(side="left", padx=(0, 10))
                 
-                # IntVarの初期化 (既存の値があれば引き継ぐ)
                 if m_id not in vars_dict["perf_vars"]:
                     saved_perf = model_perf_data.get(m_id)
                     if saved_perf:
                         def_rpm = saved_perf.get("rpm")
                         def_thr = saved_perf.get("threads")
                     else:
-                        # 内部辞書（API制限）からデフォルトを適用
                         limits = self.model_limits.get(m_id, {})
                         def_rpm = limits.get("free_rpm" if is_free else "paid_rpm", 2 if "pro" in m_id.lower() and is_free else (150 if "pro" in m_id.lower() else (15 if is_free else 300)))
                         def_thr = limits.get("free_threads" if is_free else "paid_threads", 1 if "pro" in m_id.lower() and is_free else (5 if "pro" in m_id.lower() else (1 if is_free else 5)))
@@ -492,7 +489,6 @@ class APISettingsDialog(ctk.CTkToplevel):
         for f_list in self.fav_lists:
             f_list.set_items(self.saved_prompts)
 
-    # ℹ️ 制限と仕様を確認用のダイアログ表示
     def show_limit_info(self, is_f):
         info_win = ctk.CTkToplevel(self)
         info_win.title("Gemini API 制限と仕様一覧")
@@ -588,7 +584,6 @@ class APISettingsDialog(ctk.CTkToplevel):
                      
         ctk.CTkButton(scroll, text="閉じる", command=info_win.destroy, width=150, fg_color="gray").pack(pady=(0, 20))
 
-
     def save_and_close(self):
         new_settings = {
             "plan": self.plan_var.get(),
@@ -596,18 +591,15 @@ class APISettingsDialog(ctk.CTkToplevel):
             "saved_prompts": self.saved_prompts,
         }
         
-        # 保存時に現在の情報を取得
         for plan_type, controls in zip(["free", "paid"], self.tab_controls):
             v = self.vars[plan_type]
             cbs = controls["model_combos"]
             
-            # Step1~3 のモデル割り当て
             for step_idx, step_name in enumerate(["step1", "step2", "step3"]):
                 current_display = cbs[step_idx].get()
                 matched_id = next((m[1] for m in self.models_list if m[0] == current_display), current_display)
                 new_settings[f"{plan_type}_model_{step_name}"] = matched_id
                 
-            # モデルごとのパフォーマンス (RPM/Threads) を辞書化して保存
             model_perf_dict = {}
             for m_id, p_vars in v["perf_vars"].items():
                 model_perf_dict[m_id] = {
