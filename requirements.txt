@@ -5,6 +5,7 @@ opencv-python
 numpy
 Pillow
 pydantic
-google-generativeai
+google-generativeai>=0.5.4
+openai>=1.0.0
 pandas
 openpyxl

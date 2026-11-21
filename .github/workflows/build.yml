@@ -25,20 +25,22 @@ jobs:
         pip install -r requirements.txt
         pip install pyinstaller
 
-    # PyInstallerでexe化の実行 (モジュール分割に対応)
+    # PyInstallerでexe化の実行 (モジュール分割・Azure OpenAI SDK・CustomTkinter対応)
     - name: Build with PyInstaller
       run: >
         pyinstaller 
         --onefile 
         --noconsole 
         --clean 
-        --name "DrawingAnalysisMiya-v1.0.0" 
-        --add-data "README.md;."
+        --name "DrawingAnalysisMiya-v2.0.0" 
+        --add-data "readme.md;."
+        --collect-data "customtkinter"
+        --hidden-import "openai"
         app.py
 
     # 完成したexeファイルをGitHub上にアップロード
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: DrawingAnalysisMiya-v1.0.0
-        path: dist/DrawingAnalysisMiya-v1.0.0.exe
+        name: DrawingAnalysisMiya-v2.0.0
+        path: dist/DrawingAnalysisMiya-v2.0.0.exe
