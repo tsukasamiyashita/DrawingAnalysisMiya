@@ -18,6 +18,7 @@ import math
 import operator
 import os
 import re
+import threading
 import warnings
 from typing import List
 
@@ -699,7 +700,18 @@ def recommend_truck(
     else:
         reasons.append("総重量データなし（寸法ベースまたは目安表示）")
     if dim_l > 0 or dim_w > 0 or dim_h > 0:
-        reasons.append(f"最大外形/長尺目安 L{dim_l:,.0f} × W{dim_w:,.0f} × H{dim_h:,.0f} mm")
+        reasons.append(f"最大外形/長尺目安 長さ {dim_l:,.0f} × 幅 {dim_w:,.0f} × 高さ {dim_h:,.0f} mm")
+    if dim_w > 2400:
+        if 0 < dim_h <= 2150:
+            reasons.append(
+                f"平置き幅 {dim_w:,.0f}mm が標準荷台幅(2,400mm)を超過（厚み {dim_h:,.0f}mm のため立て積み・斜め積み・分割輸送も検討可）"
+            )
+        else:
+            reasons.append(
+                f"幅 {dim_w:,.0f}mm が標準荷台幅(2,400mm)を超過（特殊輸送・分割輸送を要検討）"
+            )
+    if dim_l > 9600:
+        reasons.append(f"長さ {dim_l:,.0f}mm が標準10t車荷台長(9,600mm)を超過")
     if dim_h > 2400:
         reasons.append("高さが 2,400mm を超えるため低床車・横倒し積載・分割輸送を要確認")
 
@@ -725,6 +737,84 @@ def recommend_truck(
     }
 
 
+def _infer_overall_dimensions_fallback(overall, parts, materials):
+    """
+    AIが全体外形寸法 (L/W/H) の一部または全部を 0.0 で返した場合に、
+    部品要素の寸法記述や部材表の最大寸法から安全に概算補完する（AIが正の値を返した軸は優先維持）。
+    """
+    od = {
+        "length_mm": max(0.0, safe_float((overall or {}).get("length_mm", 0.0))),
+        "width_mm": max(0.0, safe_float((overall or {}).get("width_mm", 0.0))),
+        "height_mm": max(0.0, safe_float((overall or {}).get("height_mm", 0.0))),
+        "transport_notes": str((overall or {}).get("transport_notes") or ""),
+    }
+    if od["length_mm"] > 0 and od["width_mm"] > 0 and od["height_mm"] > 0:
+        return od
+
+    cand_l, cand_w, cand_h = 0.0, 0.0, 0.0
+    dim_texts = []
+    for p in parts or []:
+        for elem in p.get("elements", []) or []:
+            dim_texts.append(str(elem.get("dimensions") or ""))
+    for m in materials or []:
+        dim_texts.append(str(m.get("cut_dimensions") or ""))
+        c_len = safe_float(m.get("cut_length_mm", 0.0))
+        if c_len > cand_l:
+            cand_l = c_len
+
+    for txt in dim_texts:
+        if not txt:
+            continue
+        # 明示ラベル付き W/L/H/D の読み取り（日本語直後 '全体W2880' 等にも対応）
+        found_l, found_w, found_h, found_d = 0.0, 0.0, 0.0, 0.0
+        for m_hit in re.finditer(
+            r"(?<![A-Za-z0-9])([LWHD])\s*[=:]?\s*(\d+(?:\.\d+)?)", txt, re.IGNORECASE
+        ):
+            axis = m_hit.group(1).upper()
+            v = safe_float(m_hit.group(2))
+            if axis == "L":
+                found_l = max(found_l, v)
+            elif axis == "W":
+                found_w = max(found_w, v)
+            elif axis == "H":
+                found_h = max(found_h, v)
+            elif axis == "D":
+                found_d = max(found_d, v)
+
+        # W×H×D（Lなし）表記の場合は3軸を大きい順に L/W/H として補完
+        if found_l == 0.0 and found_w > 0.0 and found_h > 0.0 and found_d > 0.0:
+            vals = sorted([found_w, found_h, found_d], reverse=True)
+            cand_l = max(cand_l, vals[0])
+            cand_w = max(cand_w, vals[1])
+            cand_h = max(cand_h, vals[2])
+        else:
+            cand_l = max(cand_l, found_l)
+            cand_w = max(cand_w, found_w)
+            cand_h = max(cand_h, found_h, found_d)
+
+        # A x B x C 形式（各数値の前に任意で L/W/H/D/t が付く3辺表記も含む）の読み取り
+        m_trip = re.search(
+            r"(?:[LWHDtT]\s*[=:]?\s*)?(\d+(?:\.\d+)?)\s*[×xX*]\s*(?:[LWHDtT]\s*[=:]?\s*)?(\d+(?:\.\d+)?)\s*[×xX*]\s*(?:[LWHDtT]\s*[=:]?\s*)?(\d+(?:\.\d+)?)",
+            txt,
+        )
+        if m_trip:
+            vals = sorted(
+                [safe_float(m_trip.group(1)), safe_float(m_trip.group(2)), safe_float(m_trip.group(3))],
+                reverse=True,
+            )
+            cand_l = max(cand_l, vals[0])
+            cand_w = max(cand_w, vals[1])
+            cand_h = max(cand_h, vals[2])
+
+    if od["length_mm"] <= 0 and cand_l > 0:
+        od["length_mm"] = cand_l
+    if od["width_mm"] <= 0 and cand_w > 0:
+        od["width_mm"] = cand_w
+    if od["height_mm"] <= 0 and cand_h > 0:
+        od["height_mm"] = cand_h
+    return od
+
+
 def build_estimation_and_logistics_summary(
     result_data, custom_prices=None, default_unit_price=250.0, default_density=7.85
 ):
@@ -741,7 +831,9 @@ def build_estimation_and_logistics_summary(
     materials = result_data.get("materials", [])
     purchased = result_data.get("purchased_parts", [])
     machined = result_data.get("machined_parts", [])
-    overall = result_data.get("overall_dimensions", {}) or {}
+    overall = _infer_overall_dimensions_fallback(
+        result_data.get("overall_dimensions", {}) or {}, parts, materials
+    )
 
     # 1. 材質別重量集計（体積解析結果があればそちらを優先し、なければ部材表の計算重量を使用）
     mat_weight_map = {}  # {material_label: {"density": float, "weight_kg": float}}
@@ -1114,8 +1206,28 @@ def _call_model(
 # ==============================
 # 解析パイプライン本体
 # ==============================
+def _emit_progress(progress_callback, ratio, phase, detail=""):
+    if progress_callback:
+        try:
+            clamped = max(0.0, min(1.0, float(ratio)))
+            progress_callback(clamped, str(phase or ""), str(detail or ""))
+        except Exception:
+            pass
+
+
 def _run_volume_step1_and_step2(
-    cfg, api_image, text_pdf, density, status_callback=None, cancel_event=None
+    cfg,
+    api_image,
+    text_pdf,
+    density,
+    status_callback=None,
+    cancel_event=None,
+    progress_callback=None,
+    step1_ratio=0.20,
+    step2_start=0.32,
+    step2_end=0.68,
+    phase1_label="フェーズ 2/4: 部品一覧・数量抽出",
+    phase2_label="フェーズ 3/4: 部品ごとの三面図解析",
 ):
     """体積・重量解析の Step1 (部品一覧・数量・全体外形寸法) と Step2 (並列要素抽出) を実行する"""
     def _status(msg):
@@ -1126,7 +1238,9 @@ def _run_volume_step1_and_step2(
     engine_label = cfg["engine_label"]
 
     _check_cancel(cancel_event)
-    _status(f"[体積解析 1/3] 部品一覧・数量・全体外形寸法を抽出中 ({engine_label} / {cfg['target_step1']})...")
+    step1_msg = f"[体積解析 1/3] 部品一覧・数量・全体外形寸法を抽出中 ({engine_label} / {cfg['target_step1']})..."
+    _status(step1_msg)
+    _emit_progress(progress_callback, step1_ratio, phase1_label, step1_msg)
     step1_prompt = f"""
     あなたは2D機械図面解析・見積り・搬送計画のエキスパートです。
     提供された図面画像とアノテーションIDテキストから、以下をすべて正確に抽出してください。
@@ -1159,8 +1273,23 @@ def _run_volume_step1_and_step2(
     }
 
     extracted_parts_basic = part_list_data.get("parts", [])
+    total_parts = len(extracted_parts_basic)
     final_parts = []
     fatal_error_box = {"err": None}
+
+    if total_parts == 0:
+        _emit_progress(progress_callback, step2_end, phase2_label, "対象部品なし（次フェーズへ移行）")
+        return final_parts, overall_dims
+
+    _emit_progress(
+        progress_callback,
+        step2_start,
+        phase2_label,
+        f"部品詳細(三面図)を並列解析中... (0/{total_parts} 件完了)",
+    )
+
+    progress_lock = threading.Lock()
+    completed_count = {"n": 0}
 
     def process_part(idx, p_basic):
         if fatal_error_box["err"] is not None:
@@ -1170,7 +1299,7 @@ def _run_volume_step1_and_step2(
         p_name = p_basic.get("part_name", "不明")
         p_num = p_basic.get("part_number", "")
         _status(
-            f"[体積解析 2/3] 部品詳細(三面図)を解析中... ({idx + 1}/{len(extracted_parts_basic)}) {p_name}"
+            f"[体積解析 2/3] 部品詳細(三面図)を解析中... ({idx + 1}/{total_parts}) {p_name}"
         )
 
         step2_prompt = f"""
@@ -1189,7 +1318,8 @@ def _run_volume_step1_and_step2(
            - 破線（隠れ線）: 内部空洞や裏側の形状（穴、ザグリ、スロットなど、体積を『引き算（マイナス）』すべき領域）。
            - 一点鎖線（中心線）: 円柱・円形穴の中心、対称軸。
         3. 正面図・平面図・側面図の対応関係から統合寸法（W x H x D）を正確に特定すること。
-        4. 「calculation_formula」は純粋な算術式（数値、小数点、`+,-,*,/`、括弧 `()`、べき乗 `**` のみ）とし、円周率は `3.14159265`、穴・切り欠き等の除去部は先頭にマイナスをつけた式にすること。
+        4. 「calculation_formula」は純粋な算術式（数値、小数点、`+,-,*,/`、括弧 `()`、べき乗 `**` のみ）とし、円周率は `3.14159265` を使用すること。
+        5. 【符号ルール厳守】名称に「穴」「孔」「円孔」「タップ」「ザグリ」「切り欠き」「長穴」「肉抜き」を含む空間・除去部の数式は、必ず先頭にマイナス `-` を付けて体積から引き算すること（例: `-2*3.14159265*(80**2)*16`）。正の値にして足し算しないこと。
         
         テキストデータ:
         {text_pdf}
@@ -1224,16 +1354,31 @@ def _run_volume_step1_and_step2(
         }
 
     max_workers = max(1, cfg["threads_step2"])
+    results_by_idx = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(process_part, idx, p)
+        future_to_idx = {
+            executor.submit(process_part, idx, p): (idx, p.get("part_name", "不明"))
             for idx, p in enumerate(extracted_parts_basic)
-        ]
-        for future in futures:
+        }
+        for future in concurrent.futures.as_completed(future_to_idx):
             _check_cancel(cancel_event)
+            idx, p_name = future_to_idx[future]
             result = future.result()
             if result is not None:
-                final_parts.append(result)
+                results_by_idx[idx] = result
+            with progress_lock:
+                completed_count["n"] += 1
+                done_n = completed_count["n"]
+            ratio = step2_start + (step2_end - step2_start) * (done_n / max(1, total_parts))
+            _emit_progress(
+                progress_callback,
+                ratio,
+                phase2_label,
+                f"部品詳細(三面図)解析: {done_n}/{total_parts} 件完了 ({p_name})",
+            )
+
+    for idx in sorted(results_by_idx.keys()):
+        final_parts.append(results_by_idx[idx])
 
     if fatal_error_box["err"] is not None:
         raise fatal_error_box["err"]
@@ -1353,12 +1498,18 @@ def _run_parts_breakdown_analysis(
 
     known_parts_block = ""
     if known_parts:
-        lines = [
-            f"- 品番:{p.get('part_number', '')} 品名:{p.get('part_name', '')} 材質:{p.get('material', '')} 数量:{p.get('quantity', 1)}"
-            for p in known_parts
-        ]
+        lines = []
+        for p in known_parts:
+            lines.append(
+                f"- 品番:{p.get('part_number', '')} 品名:{p.get('part_name', '')} 材質:{p.get('material', '')} 数量:{p.get('quantity', 1)}"
+            )
+            for elem in (p.get("elements") or [])[:12]:
+                e_name = str(elem.get("element_name") or "").strip()
+                e_dim = str(elem.get("dimensions") or "").strip()
+                if e_name and not any(k in e_name for k in ("穴", "孔", "タップ", "ザグリ", "切り欠き")):
+                    lines.append(f"    └ 構成要素: {e_name} ({e_dim})")
         known_parts_block = (
-            "\n【参考: すでに認識された部品一覧（品番・品名・数量の整合性を可能な限り揃えてください）】\n"
+            "\n【参考: すでに認識された部品・構成要素一覧（品番・品名・数量・鋼材構成の整合性を揃えてください）】\n"
             + "\n".join(lines)
             + "\n"
         )
@@ -1371,7 +1522,8 @@ def _run_parts_breakdown_analysis(
     {chr(10).join(instructions)}
 
     【分類の整合性ルール】
-    - ボルト・ベアリング・シリンダ等の市販品・JIS規格品は「使用購入品」に分類し、「使用機械加工品」には重複計上しないでください。
+    - ボルト・ベアリング・シリンダ・アンカー・座金等の市販品・JIS規格品は「使用購入品」に分類し、「使用機械加工品」には重複計上しないでください。
+    - 溶接構造物・製缶フレーム・機械加工品を構成する形鋼（H形鋼・溝形鋼・山形鋼・角パイプ等）や鋼板(PL)・丸棒・平鋼などの素材鋼材は、製缶品/加工品とは別に「部材表 (materials)」へ構成部材ごとに必ず分解してすべて列挙してください（製缶図面で materials を空リストにしないこと）。
     - 図面の部品表（BOM）、表題欄、注記、バルーン記号、寸法・切断長・公差・表面処理記号をすべて確認してください。
     - 数値や記号は半角英数字で見やすく統一してください。
     {chr(10).join(exclude_notes)}
@@ -1424,11 +1576,24 @@ def run_drawing_analysis(
     preview_callback=None,
     page_index=0,
     cancel_event=None,
+    progress_callback=None,
 ):
     """
     選択された解析項目 (targets) に基づき図面解析を実行して統合結果辞書を返す。
     """
     _check_cancel(cancel_event)
+    want_volume = bool(targets.get("volume"))
+    want_breakdown = any(
+        targets.get(k) for k in ("materials", "purchased_parts", "machined_parts")
+    )
+    total_phases = 4 if (want_volume and want_breakdown) else (3 if want_volume else 2)
+
+    _emit_progress(
+        progress_callback,
+        0.05,
+        f"フェーズ 1/{total_phases}: 図面読み込み・前処理",
+        "PDF / 画像の読み込みと Visual Grounding を生成中...",
+    )
     cfg = _resolve_runtime_config(settings)
     processed_image_pil, api_image, text_pdf = prepare_drawing_inputs(
         file_path, page_index=page_index, status_callback=status_callback
@@ -1442,9 +1607,11 @@ def run_drawing_analysis(
     if cfg["provider"] == "azure":
         cfg["image_data_url"] = encode_pil_image_data_url(api_image)
 
-    want_volume = bool(targets.get("volume"))
-    want_breakdown = any(
-        targets.get(k) for k in ("materials", "purchased_parts", "machined_parts")
+    _emit_progress(
+        progress_callback,
+        0.15,
+        f"フェーズ 1/{total_phases}: 前処理完了",
+        "AI 解析を開始しています...",
     )
 
     default_den = safe_float(density) or 7.85
@@ -1454,13 +1621,31 @@ def run_drawing_analysis(
 
     if want_volume and want_breakdown:
         final_parts, overall_vol = _run_volume_step1_and_step2(
-            cfg, api_image, text_pdf, density, status_callback, cancel_event
+            cfg,
+            api_image,
+            text_pdf,
+            density,
+            status_callback,
+            cancel_event,
+            progress_callback=progress_callback,
+            step1_ratio=0.20,
+            step2_start=0.32,
+            step2_end=0.68,
+            phase1_label="フェーズ 2/4: 部品一覧・数量抽出",
+            phase2_label="フェーズ 3/4: 部品ごとの三面図解析",
         )
         _check_cancel(cancel_event)
 
         if cfg["threads_step3"] >= 2:
+            msg_par = "体積最終検証と部材表・手配リスト解析を並列実行中..."
             if status_callback:
-                status_callback("体積最終検証と部材表・手配リスト解析を並列実行中...")
+                status_callback(msg_par)
+            _emit_progress(
+                progress_callback,
+                0.72,
+                "フェーズ 4/4: 最終検証 ＆ 部材表・手配解析",
+                msg_par,
+            )
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 fut_verify = executor.submit(
                     _run_volume_step3_verification,
@@ -1482,11 +1667,35 @@ def run_drawing_analysis(
                     status_callback,
                     cancel_event,
                 )
+                done_parallel = 0
+                for done_fut in concurrent.futures.as_completed([fut_verify, fut_breakdown]):
+                    done_parallel += 1
+                    _check_cancel(cancel_event)
+                    if done_parallel == 1:
+                        label = "体積最終検証が完了（部材表・手配解析を待機中...）" if done_fut is fut_verify else "部材表・手配解析が完了（体積最終検証を待機中...）"
+                        _emit_progress(
+                            progress_callback,
+                            0.84,
+                            "フェーズ 4/4: 最終検証 ＆ 部材表・手配解析",
+                            label,
+                        )
                 missing_parts = fut_verify.result()
                 materials, purchased_parts, machined_parts, overall_brk = fut_breakdown.result()
         else:
+            _emit_progress(
+                progress_callback,
+                0.72,
+                "フェーズ 4/4: 抽出漏れ最終検証",
+                "三面図からの抽出漏れがないか最終検証中...",
+            )
             missing_parts = _run_volume_step3_verification(
                 cfg, api_image, text_pdf, density, final_parts, status_callback, cancel_event
+            )
+            _emit_progress(
+                progress_callback,
+                0.84,
+                "フェーズ 4/4: 部材表・手配リスト解析",
+                "部材表・購入品・機械加工品を抽出中...",
             )
             materials, purchased_parts, machined_parts, overall_brk = _run_parts_breakdown_analysis(
                 cfg,
@@ -1504,7 +1713,24 @@ def run_drawing_analysis(
 
     elif want_volume:
         final_parts, overall_vol = _run_volume_step1_and_step2(
-            cfg, api_image, text_pdf, density, status_callback, cancel_event
+            cfg,
+            api_image,
+            text_pdf,
+            density,
+            status_callback,
+            cancel_event,
+            progress_callback=progress_callback,
+            step1_ratio=0.22,
+            step2_start=0.35,
+            step2_end=0.76,
+            phase1_label="フェーズ 2/3: 部品一覧・数量抽出",
+            phase2_label="フェーズ 2/3: 部品ごとの三面図解析",
+        )
+        _emit_progress(
+            progress_callback,
+            0.80,
+            "フェーズ 3/3: 抽出漏れ最終検証",
+            "三面図からの抽出漏れがないか最終検証中...",
         )
         missing_parts = _run_volume_step3_verification(
             cfg, api_image, text_pdf, density, final_parts, status_callback, cancel_event
@@ -1514,10 +1740,22 @@ def run_drawing_analysis(
         calculate_volume_and_weight(final_parts, default_density=default_den)
 
     elif want_breakdown:
+        _emit_progress(
+            progress_callback,
+            0.30,
+            "フェーズ 2/2: 部材表・手配リスト解析",
+            "選択された手配・部材表カテゴリを AI が抽出中...",
+        )
         materials, purchased_parts, machined_parts, overall_brk = _run_parts_breakdown_analysis(
             cfg, api_image, text_pdf, targets, None, status_callback, cancel_event
         )
 
+    _emit_progress(
+        progress_callback,
+        0.96,
+        "集計・重量/搬送サマリー計算中",
+        "体積・重量・定尺本数・推奨トラックを集計しています...",
+    )
     if materials:
         calculate_materials_metrics(materials, default_density=default_den)
     for item in purchased_parts:
@@ -1526,6 +1764,7 @@ def run_drawing_analysis(
         item["quantity"] = safe_quantity(item.get("quantity", 1))
 
     overall_dims = _merge_overall_dims(overall_vol, overall_brk)
+    _emit_progress(progress_callback, 1.0, "解析完了", "すべての解析・集計が完了しました")
 
     return {
         "targets": dict(targets),
@@ -1585,9 +1824,19 @@ def build_export_tables(result_data, custom_prices=None, default_unit_price=250.
         )
         summary_rows.append(
             {
+                "区分": "製品最大外形寸法",
+                "項目": "最大長さ (L) × 最大幅 (W) × 最大高さ (H)",
+                "値 / 内容": (
+                    f"最大長さ {od['length_mm']:,.0f} mm ／ 最大幅 {od['width_mm']:,.0f} mm ／ 最大高さ {od['height_mm']:,.0f} mm"
+                ),
+                "補足 / 根拠": "図面から読み取った製品・ユニット全体の最大外形寸法",
+            }
+        )
+        summary_rows.append(
+            {
                 "区分": "全体寸法・総重量",
-                "項目": "製品全体外形 / 総重量",
-                "値 / 内容": f"L{od['length_mm']:,.0f} × W{od['width_mm']:,.0f} × H{od['height_mm']:,.0f} mm ／ {summary['total_weight_kg']:,.2f} kg",
+                "項目": "総重量",
+                "値 / 内容": f"{summary['total_weight_kg']:,.2f} kg",
                 "補足 / 根拠": f"重量算出元: {summary['weight_source']}",
             }
         )

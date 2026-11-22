@@ -273,7 +273,13 @@ def build_excel_workbook(tables, source_file_path="", page_note="", as_template=
             is_summary_key_row = (
                 sheet_name == "見積り・搬送サマリー"
                 and len(row_vals) >= 2
-                and str(row_vals[1]) in ("推奨トラック車種", "概算材料費 合計", "製品全体外形 / 総重量")
+                and str(row_vals[1])
+                in (
+                    "推奨トラック車種",
+                    "概算材料費 合計",
+                    "最大長さ (L) × 最大幅 (W) × 最大高さ (H)",
+                    "総重量",
+                )
             )
 
             max_lines = 1
@@ -332,9 +338,10 @@ def build_excel_workbook(tables, source_file_path="", page_note="", as_template=
         ws.freeze_panes = "A5"
         _apply_print_setup(ws, num_cols, last_row, drawing_label)
 
-    # 最初のシートをアクティブにする
-    if wb.sheetnames:
-        wb.active = 0
+    # 最初のシートをアクティブにする（全シート空の異常をガード）
+    if not wb.sheetnames:
+        raise ValueError("出力可能なシートデータがありません。")
+    wb.active = 0
 
     wb.template = bool(as_template)
     return wb

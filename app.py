@@ -378,6 +378,9 @@ class DrawingAnalysisApp(ctk.CTk):
         self.last_result_data = None
         self._cancel_event = None
         self._is_analyzing = False
+        self._analysis_start_time = None
+        self._current_progress_ratio = 0.0
+        self._elapsed_timer_id = None
 
         self.default_free_perf = get_default_gemini_perf_map(DEFAULT_GEMINI_MODELS, is_free=True)
         self.default_paid_perf = get_default_gemini_perf_map(DEFAULT_GEMINI_MODELS, is_free=False)
@@ -430,7 +433,8 @@ class DrawingAnalysisApp(ctk.CTk):
                 "purchased_parts": True,
                 "machined_parts": True,
             },
-            # 見積り用材料単価設定
+            # 基本比重・見積り用材料単価設定
+            "default_density": 7.85,
             "default_unit_price": 250.0,
             "material_unit_prices": copy.deepcopy(DEFAULT_MATERIAL_UNIT_PRICES),
         }
@@ -451,7 +455,34 @@ class DrawingAnalysisApp(ctk.CTk):
 
         self._sort_states = {}
         self._setup_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(200, self._maximize_window)
+
+    def _on_close(self):
+        """ウィンドウ終了時に実行中の解析・タイマーを安全に停止してから終了する"""
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        self._stop_elapsed_timer()
+        self.destroy()
+
+    def _get_effective_default_unit_price(self):
+        """入力欄の基本単価を取得する（0円も有効値として扱い、空欄・不正値のみ設定値へフォールバック）"""
+        if hasattr(self, "unit_price_entry"):
+            raw = str(self.unit_price_entry.get()).strip().replace(",", "")
+            if raw:
+                try:
+                    val = float(raw)
+                    if val >= 0.0:
+                        return val
+                except ValueError:
+                    pass
+        return max(0.0, safe_float(self.api_settings.get("default_unit_price", 250.0)))
+
+    def _set_page_selector(self, values, selected_label, enabled):
+        """disabled 状態での set() 無視バグを防ぐため、必ず normal で値を設定してから状態を反映する"""
+        self.page_selector.configure(state="normal", values=values)
+        self.page_selector.set(selected_label)
+        self.page_selector.configure(state="readonly" if enabled else "disabled")
 
     def _safe_after(self, delay_ms, fn):
         try:
@@ -563,6 +594,11 @@ class DrawingAnalysisApp(ctk.CTk):
                 for k, v in DEFAULT_MATERIAL_UNIT_PRICES.items():
                     self.api_settings["material_unit_prices"].setdefault(k, v)
 
+            den_loaded = safe_float(self.api_settings.get("default_density", 7.85))
+            self.api_settings["default_density"] = den_loaded if den_loaded > 0.0 else 7.85
+            price_loaded = safe_float(self.api_settings.get("default_unit_price", 250.0))
+            self.api_settings["default_unit_price"] = max(0.0, price_loaded)
+
         except Exception as e:
             print(f"Load settings error: {e}")
 
@@ -571,11 +607,86 @@ class DrawingAnalysisApp(ctk.CTk):
         try:
             if hasattr(self, "target_vars"):
                 self.api_settings["analysis_targets"] = self._get_selected_targets()
+            if hasattr(self, "density_entry"):
+                den_val = safe_float(self.density_entry.get())
+                if den_val > 0.0:
+                    self.api_settings["default_density"] = den_val
+            if hasattr(self, "unit_price_entry"):
+                raw_price = str(self.unit_price_entry.get()).strip()
+                if raw_price:
+                    try:
+                        p_val = float(raw_price.replace(",", ""))
+                        if p_val >= 0.0:
+                            self.api_settings["default_unit_price"] = p_val
+                    except ValueError:
+                        pass
             os.makedirs(SETTINGS_DIR, exist_ok=True)
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.api_settings, f, ensure_ascii=False, indent=4)
         except Exception as e:
             print(f"Save settings error: {e}")
+
+    @staticmethod
+    def _format_density(val):
+        d = safe_float(val)
+        if d <= 0.0:
+            d = 7.85
+        return f"{d:g}"
+
+    def save_basic_params(self, explicit=True):
+        """基本比重・基本単価を検証して設定ファイルへ保存し、表示中の見積りへも即反映する"""
+        raw_den = str(self.density_entry.get()).strip().replace(",", "")
+        raw_price = str(self.unit_price_entry.get()).strip().replace(",", "")
+        try:
+            den_val = float(raw_den)
+            if den_val <= 0.0:
+                raise ValueError("density must be positive")
+        except ValueError:
+            if explicit:
+                messagebox.showwarning(
+                    "入力エラー",
+                    "基本比重には 0 より大きい数値（例: 7.85）を入力してください。",
+                    parent=self,
+                )
+            return False
+
+        try:
+            price_val = float(raw_price)
+            if price_val < 0.0:
+                raise ValueError("price must be non-negative")
+        except ValueError:
+            if explicit:
+                messagebox.showwarning(
+                    "入力エラー",
+                    "基本単価には 0 以上の数値（例: 250）を入力してください。",
+                    parent=self,
+                )
+            return False
+
+        prev_den = safe_float(self.api_settings.get("default_density", 7.85))
+        prev_price = safe_float(self.api_settings.get("default_unit_price", 250.0))
+        changed = (abs(den_val - prev_den) > 1e-6) or (abs(price_val - prev_price) > 1e-6)
+
+        self.api_settings["default_density"] = den_val
+        self.api_settings["default_unit_price"] = price_val
+
+        if changed or explicit:
+            self.save_settings()
+            if self.last_result_data:
+                self.last_result_data["default_density"] = den_val
+                self._refresh_summary_views(self.last_result_data)
+            self.update_status(
+                f"基本比重 ({self._format_density(den_val)} g/cm³)・基本単価 ({int(round(price_val)):,} 円/kg) を保存しました"
+            )
+            if explicit and hasattr(self, "save_params_btn"):
+                self.save_params_btn.configure(text="✅ 保存しました", fg_color="#D1E7DD", text_color="#0F5132")
+                self._safe_after(
+                    1600,
+                    lambda: self.save_params_btn.configure(
+                        text="💾 比重・単価を保存", fg_color="#E7F1FF", text_color=PRIMARY
+                    ),
+                )
+        return True
 
     def _get_selected_targets(self):
         return {k: bool(v.get()) for k, v in self.target_vars.items()}
@@ -754,15 +865,62 @@ class DrawingAnalysisApp(ctk.CTk):
         return tree
 
     def _build_summary_tab(self, tab_summary):
-        """見積り（材質別重量・金額）・搬送（推奨トラック）・定尺発注集計ダッシュボードを構築"""
+        """見積り（材質別重量・金額）・最大外形寸法・搬送（推奨トラック）・定尺発注集計ダッシュボードを構築"""
         scroll = ctk.CTkScrollableFrame(tab_summary, fg_color=BG_COLOR)
         scroll.pack(fill="both", expand=True, padx=2, pady=2)
+
+        # 0. 製品最大外形寸法（最大長さ・最大幅・最大高さ）＆ 総重量 KPI カード
+        dim_card = ctk.CTkFrame(
+            scroll, fg_color=CARD_BG, corner_radius=8, border_width=1, border_color=BORDER_COLOR
+        )
+        dim_card.pack(fill="x", padx=6, pady=(4, 8))
+
+        ctk.CTkLabel(
+            dim_card,
+            text="📏 図面の製品最大外形寸法 ＆ 総重量",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=PRIMARY,
+        ).pack(anchor="w", padx=12, pady=(8, 4))
+
+        kpi_grid = ctk.CTkFrame(dim_card, fg_color="transparent")
+        kpi_grid.pack(fill="x", padx=10, pady=(0, 10))
+        for col_i in range(4):
+            kpi_grid.grid_columnconfigure(col_i, weight=1)
+
+        def _make_kpi_box(col_i, caption, init_val, val_color=PRIMARY):
+            box = ctk.CTkFrame(
+                kpi_grid,
+                fg_color="#F8FAFC",
+                corner_radius=6,
+                border_width=1,
+                border_color=BORDER_COLOR,
+            )
+            box.grid(row=0, column=col_i, sticky="ew", padx=4, pady=2)
+            ctk.CTkLabel(
+                box,
+                text=caption,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=MUTED_TEXT,
+            ).pack(anchor="w", padx=10, pady=(6, 0))
+            val_lbl = ctk.CTkLabel(
+                box,
+                text=init_val,
+                font=ctk.CTkFont(size=16, weight="bold"),
+                text_color=val_color,
+            )
+            val_lbl.pack(anchor="w", padx=10, pady=(2, 6))
+            return val_lbl
+
+        self.dim_length_label = _make_kpi_box(0, "最大長さ (L)", "--- mm")
+        self.dim_width_label = _make_kpi_box(1, "最大幅 (W)", "--- mm")
+        self.dim_height_label = _make_kpi_box(2, "最大高さ (H)", "--- mm")
+        self.dim_weight_label = _make_kpi_box(3, "総重量", "--- kg", val_color=COLOR_SUCCESS)
 
         # 1. 搬送・トラック選定カード
         truck_card = ctk.CTkFrame(
             scroll, fg_color=CARD_BG, corner_radius=8, border_width=1, border_color=BORDER_COLOR
         )
-        truck_card.pack(fill="x", padx=6, pady=(4, 8))
+        truck_card.pack(fill="x", padx=6, pady=(0, 8))
 
         truck_head = ctk.CTkFrame(truck_card, fg_color="transparent")
         truck_head.pack(fill="x", padx=12, pady=(8, 4))
@@ -1036,7 +1194,6 @@ class DrawingAnalysisApp(ctk.CTk):
             self.page_row,
             values=["1 / 1"],
             width=120,
-            state="disabled",
             fg_color="white",
             border_color="#CED4DA",
             button_color="#E9ECEF",
@@ -1047,7 +1204,7 @@ class DrawingAnalysisApp(ctk.CTk):
             text_color=TEXT_COLOR,
             command=self._on_page_selected,
         )
-        self.page_selector.set("1 / 1")
+        self._set_page_selector(["1 / 1"], "1 / 1", enabled=False)
         self.page_selector.pack(side="left", fill="x", expand=True)
 
         # 解析項目の選択（複数選択可）
@@ -1115,8 +1272,12 @@ class DrawingAnalysisApp(ctk.CTk):
             border_color="#CED4DA",
             text_color=TEXT_COLOR,
         )
-        self.density_entry.insert(0, "7.85")
+        self.density_entry.insert(
+            0, self._format_density(self.api_settings.get("default_density", 7.85))
+        )
         self.density_entry.grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(2, 0))
+        self.density_entry.bind("<FocusOut>", lambda e: self.save_basic_params(explicit=False))
+        self.density_entry.bind("<Return>", lambda e: self.save_basic_params(explicit=True))
 
         self.unit_price_entry = ctk.CTkEntry(
             param_grid,
@@ -1125,9 +1286,25 @@ class DrawingAnalysisApp(ctk.CTk):
             text_color=TEXT_COLOR,
         )
         self.unit_price_entry.insert(
-            0, str(int(round(safe_float(self.api_settings.get("default_unit_price", 250.0)) or 250)))
+            0, str(int(round(safe_float(self.api_settings.get("default_unit_price", 250.0)))))
         )
         self.unit_price_entry.grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(2, 0))
+        self.unit_price_entry.bind("<FocusOut>", lambda e: self.save_basic_params(explicit=False))
+        self.unit_price_entry.bind("<Return>", lambda e: self.save_basic_params(explicit=True))
+
+        self.save_params_btn = ctk.CTkButton(
+            param_grid,
+            text="💾 比重・単価を保存",
+            height=26,
+            fg_color="#E7F1FF",
+            hover_color="#CFE2FF",
+            text_color=PRIMARY,
+            border_width=1,
+            border_color="#B6D4FE",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=lambda: self.save_basic_params(explicit=True),
+        )
+        self.save_params_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         # 下部固定アクションエリア
         self.left_bottom = ctk.CTkFrame(self.left_frame, fg_color="transparent")
@@ -1156,14 +1333,57 @@ class DrawingAnalysisApp(ctk.CTk):
         )
         self.export_btn.pack(fill="x", pady=(0, 8))
 
-        self.status_label = ctk.CTkLabel(
+        # 実行進捗カード（フェーズ・進捗率・経過時間・プログレスバー・詳細ステータス）
+        self.progress_card = ctk.CTkFrame(
             self.left_bottom,
-            text="待機中...",
-            font=ctk.CTkFont(slant="italic"),
-            text_color=MUTED_TEXT,
-            wraplength=270,
+            fg_color="#F8FAFC",
+            corner_radius=8,
+            border_width=1,
+            border_color=BORDER_COLOR,
         )
-        self.status_label.pack(pady=(2, 0))
+        self.progress_card.pack(fill="x", pady=(2, 0))
+
+        prog_top = ctk.CTkFrame(self.progress_card, fg_color="transparent")
+        prog_top.pack(fill="x", padx=10, pady=(7, 3))
+
+        self.progress_phase_label = ctk.CTkLabel(
+            prog_top,
+            text="待機中",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=PRIMARY,
+            anchor="w",
+        )
+        self.progress_phase_label.pack(side="left", fill="x", expand=True)
+
+        self.progress_meta_label = ctk.CTkLabel(
+            prog_top,
+            text="0%",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=MUTED_TEXT,
+            anchor="e",
+        )
+        self.progress_meta_label.pack(side="right", padx=(6, 0))
+
+        self.progress_bar = ctk.CTkProgressBar(
+            self.progress_card,
+            height=10,
+            corner_radius=5,
+            fg_color="#DEE2E6",
+            progress_color=PRIMARY,
+        )
+        self.progress_bar.set(0.0)
+        self.progress_bar.pack(fill="x", padx=10, pady=(0, 5))
+
+        self.status_label = ctk.CTkLabel(
+            self.progress_card,
+            text="図面を選択して「解析を実行」を押してください",
+            font=ctk.CTkFont(size=11),
+            text_color=MUTED_TEXT,
+            justify="left",
+            anchor="w",
+            wraplength=260,
+        )
+        self.status_label.pack(fill="x", padx=10, pady=(0, 7))
 
         # 右側パネル
         self.right_frame = ctk.CTkFrame(
@@ -1175,13 +1395,13 @@ class DrawingAnalysisApp(ctk.CTk):
         )
         self.right_frame.grid(row=0, column=1, padx=(0, 20), pady=20, sticky="nsew")
         self.right_frame.grid_columnconfigure(0, weight=1)
-        self.right_frame.grid_rowconfigure(1, weight=1)
+        self.right_frame.grid_rowconfigure(2, weight=1)
 
         # プレビューコンテナ
         self.preview_container = ctk.CTkFrame(
-            self.right_frame, fg_color="#E9ECEF", corner_radius=10, height=260
+            self.right_frame, fg_color="#E9ECEF", corner_radius=10, height=250
         )
-        self.preview_container.grid(row=0, column=0, padx=20, pady=(16, 10), sticky="nsew")
+        self.preview_container.grid(row=0, column=0, padx=20, pady=(14, 8), sticky="nsew")
         self.preview_container.grid_columnconfigure(0, weight=1)
         self.preview_container.grid_rowconfigure(0, weight=1)
 
@@ -1190,7 +1410,7 @@ class DrawingAnalysisApp(ctk.CTk):
             text="図面プレビュー（ファイル選択で表示・クリックで拡大）",
             fg_color="transparent",
             text_color=MUTED_TEXT,
-            height=260,
+            height=250,
             cursor="hand2",
         )
         self.preview_label.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
@@ -1210,6 +1430,25 @@ class DrawingAnalysisApp(ctk.CTk):
             state="disabled",
         )
         self.zoom_btn.place(relx=0.985, rely=0.05, anchor="ne")
+
+        # 製品最大外形寸法（最大長さ・最大幅・最大高さ）常時表示バー
+        self.dims_bar = ctk.CTkFrame(
+            self.right_frame,
+            fg_color="#F0F6FF",
+            corner_radius=8,
+            border_width=1,
+            border_color="#CFE2FF",
+        )
+        self.dims_bar.grid(row=1, column=0, padx=20, pady=(0, 6), sticky="ew")
+
+        self.dims_bar_label = ctk.CTkLabel(
+            self.dims_bar,
+            text="📏 最大外形寸法:  最大長さ (L) --- mm  ｜  最大幅 (W) --- mm  ｜  最大高さ (H) --- mm",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=PRIMARY,
+            anchor="w",
+        )
+        self.dims_bar_label.pack(side="left", padx=12, pady=6)
 
         # Treeview 共通ライトモードスタイル
         style = ttk.Style()
@@ -1245,7 +1484,7 @@ class DrawingAnalysisApp(ctk.CTk):
             border_width=1,
             border_color=BORDER_COLOR,
         )
-        self.result_tabview.grid(row=1, column=0, padx=20, pady=(0, 8), sticky="nsew")
+        self.result_tabview.grid(row=2, column=0, padx=20, pady=(0, 8), sticky="nsew")
 
         tab_vol = self.result_tabview.add(TAB_VOLUME)
         tab_mat = self.result_tabview.add(TAB_MATERIALS)
@@ -1329,7 +1568,7 @@ class DrawingAnalysisApp(ctk.CTk):
 
         # 下部フッター
         footer_row = ctk.CTkFrame(self.right_frame, fg_color="transparent")
-        footer_row.grid(row=2, column=0, padx=20, pady=(0, 14), sticky="ew")
+        footer_row.grid(row=3, column=0, padx=20, pady=(0, 14), sticky="ew")
         ctk.CTkLabel(
             footer_row,
             text="※右クリックで行/表コピー可（部材・購入品・加工品・集計は列見出しクリックで並べ替え）",
@@ -1357,11 +1596,9 @@ class DrawingAnalysisApp(ctk.CTk):
         self.file_path_display.configure(text=os.path.basename(path), text_color=TEXT_COLOR)
 
         page_labels = [f"{i + 1} / {self.pdf_page_count}" for i in range(self.pdf_page_count)]
-        self.page_selector.configure(
-            values=page_labels,
-            state="normal" if self.pdf_page_count > 1 else "disabled",
+        self._set_page_selector(
+            page_labels, page_labels[0], enabled=(self.pdf_page_count > 1)
         )
-        self.page_selector.set(page_labels[0])
         self._load_preview_async(path, 0)
 
     def _on_page_selected(self, selected_label):
@@ -1412,9 +1649,7 @@ class DrawingAnalysisApp(ctk.CTk):
                 if m and m not in extracted_mats:
                     extracted_mats.append(m)
 
-        cur_default = safe_float(self.unit_price_entry.get()) or safe_float(
-            self.api_settings.get("default_unit_price", 250.0)
-        )
+        cur_default = self._get_effective_default_unit_price()
 
         def _on_apply(new_prices, new_default):
             self.api_settings["material_unit_prices"].update(new_prices)
@@ -1437,6 +1672,75 @@ class DrawingAnalysisApp(ctk.CTk):
     def update_status(self, text):
         self._safe_after(0, lambda t=text: self.status_label.configure(text=t))
 
+    @staticmethod
+    def _format_elapsed(seconds):
+        sec_int = max(0, int(seconds))
+        mins, secs = divmod(sec_int, 60)
+        return f"{mins:02d}:{secs:02d}"
+
+    def _refresh_progress_meta(self):
+        pct = int(round(max(0.0, min(1.0, self._current_progress_ratio)) * 100))
+        if self._analysis_start_time is not None:
+            elapsed_str = self._format_elapsed(time.perf_counter() - self._analysis_start_time)
+            meta_txt = f"{pct}%  |  {elapsed_str}"
+        else:
+            meta_txt = f"{pct}%"
+        self.progress_meta_label.configure(text=meta_txt)
+        if self._is_analyzing and self._analysis_start_time is not None:
+            elapsed_str = self._format_elapsed(time.perf_counter() - self._analysis_start_time)
+            self.total_label.configure(text=f"解析中... {pct}%（経過 {elapsed_str}）")
+
+    def _tick_elapsed_timer(self):
+        self._elapsed_timer_id = None
+        if not self._is_analyzing or not self.winfo_exists():
+            return
+        self._refresh_progress_meta()
+        try:
+            self._elapsed_timer_id = self.after(500, self._tick_elapsed_timer)
+        except Exception:
+            self._elapsed_timer_id = None
+
+    def _start_elapsed_timer(self):
+        self._stop_elapsed_timer()
+        self._analysis_start_time = time.perf_counter()
+        self._refresh_progress_meta()
+        try:
+            self._elapsed_timer_id = self.after(500, self._tick_elapsed_timer)
+        except Exception:
+            self._elapsed_timer_id = None
+
+    def _stop_elapsed_timer(self):
+        if self._elapsed_timer_id is not None:
+            try:
+                self.after_cancel(self._elapsed_timer_id)
+            except Exception:
+                pass
+            self._elapsed_timer_id = None
+
+    def _apply_progress_ui(self, ratio, phase="", detail="", bar_color=None):
+        """UIスレッド上で進捗バー・フェーズ見出し・進捗率・詳細メッセージを直接更新する"""
+        clamped = max(0.0, min(1.0, float(ratio)))
+        self._current_progress_ratio = clamped
+        self.progress_bar.set(clamped)
+        if bar_color is not None:
+            self.progress_bar.configure(progress_color=bar_color)
+        if phase:
+            self.progress_phase_label.configure(text=phase)
+        if detail:
+            self.status_label.configure(text=detail)
+        self._refresh_progress_meta()
+
+    def update_progress(self, ratio, phase="", detail="", bar_color=None):
+        """解析実行中の進捗をスレッドセーフに更新する（完了・中止後の遅延通知は無視）"""
+        clamped = max(0.0, min(1.0, float(ratio)))
+
+        def _apply():
+            if not self._is_analyzing:
+                return
+            self._apply_progress_ui(clamped, phase=phase, detail=detail, bar_color=bar_color)
+
+        self._safe_after(0, _apply)
+
     def open_api_settings(self):
         APISettingsDialog(self, self.api_settings, self.on_api_settings_saved)
 
@@ -1450,6 +1754,7 @@ class DrawingAnalysisApp(ctk.CTk):
 
     def on_api_settings_saved(self, new_settings):
         new_settings["analysis_targets"] = self._get_selected_targets()
+        new_settings["default_density"] = self.api_settings.get("default_density", 7.85)
         new_settings["default_unit_price"] = self.api_settings.get("default_unit_price", 250.0)
         new_settings["material_unit_prices"] = copy.deepcopy(
             self.api_settings.get("material_unit_prices", DEFAULT_MATERIAL_UNIT_PRICES)
@@ -1480,6 +1785,17 @@ class DrawingAnalysisApp(ctk.CTk):
             self.stock_summary_tree,
         ):
             tv.delete(*tv.get_children())
+        if hasattr(self, "dims_bar_label"):
+            self.dims_bar_label.configure(
+                text="📏 最大外形寸法:  最大長さ (L) --- mm  ｜  最大幅 (W) --- mm  ｜  最大高さ (H) --- mm"
+            )
+        if hasattr(self, "dim_length_label"):
+            self.dim_length_label.configure(text="--- mm")
+            self.dim_width_label.configure(text="--- mm")
+            self.dim_height_label.configure(text="--- mm")
+            self.dim_weight_label.configure(text="--- kg")
+        if hasattr(self, "truck_badge"):
+            self.truck_badge.configure(text=" 解析後に自動判定 ")
 
     def _set_analyzing_state(self, active):
         self._is_analyzing = active
@@ -1492,7 +1808,13 @@ class DrawingAnalysisApp(ctk.CTk):
             )
             self.select_btn.configure(state="disabled")
             self.export_btn.configure(state="disabled")
+            self._current_progress_ratio = 0.02
+            self.progress_bar.configure(progress_color=PRIMARY)
+            self.progress_bar.set(0.02)
+            self.progress_phase_label.configure(text="解析開始中...", text_color=PRIMARY)
+            self._start_elapsed_timer()
         else:
+            self._stop_elapsed_timer()
             self.analyze_btn.configure(
                 text="解析を実行",
                 fg_color=COLOR_SUCCESS,
@@ -1559,16 +1881,14 @@ class DrawingAnalysisApp(ctk.CTk):
                     self.open_api_settings()
                 return
 
-        self.api_settings["default_unit_price"] = max(
-            0.0, safe_float(self.unit_price_entry.get()) or 250.0
-        )
-        self.save_settings()
+        if not self.save_basic_params(explicit=True):
+            return
         self._cancel_event = threading.Event()
         self._set_analyzing_state(True)
         self._clear_all_result_trees()
-        self.total_label.configure(text="解析中...")
+        self.total_label.configure(text="解析中... 2%（経過 00:00）")
         settings_snapshot = copy.deepcopy(self.api_settings)
-        density_val = self.density_entry.get().strip() or "7.85"
+        density_val = self._format_density(self.api_settings.get("default_density", 7.85))
         file_path = self.selected_file_path
         page_idx = self.selected_page_index
         cancel_ev = self._cancel_event
@@ -1612,35 +1932,73 @@ class DrawingAnalysisApp(ctk.CTk):
                 preview_callback=self.update_preview,
                 page_index=page_index,
                 cancel_event=cancel_event,
+                progress_callback=self.update_progress,
             )
             elapsed = time.perf_counter() - start_time
-            self._safe_after(0, lambda d=result_data: self.display_results(d))
-            self.update_status(f"解析完了 (所要時間: {elapsed:.1f}秒)")
+
+            def _finish_success(d=result_data, el=elapsed):
+                # 1. 先に解析中フラグを解除し経過タイマーを停止（total_label上書きを防止）
+                self._set_analyzing_state(False)
+                # 2. 進捗カードを100%完了表示へ更新
+                self._apply_progress_ui(
+                    1.0,
+                    phase="✅ 解析完了",
+                    detail=f"解析完了 (所要時間: {el:.1f}秒)",
+                    bar_color=COLOR_SUCCESS,
+                )
+                # 3. 結果テーブル・サマリー・下部総重量/材料費ラベルを描画
+                self.display_results(d)
+
+            self._safe_after(0, _finish_success)
 
         except AnalysisCancelledError:
-            self.update_status("解析を中止しました。")
-            self._safe_after(0, lambda: self.total_label.configure(text="解析が中止されました"))
+            def _finish_cancelled():
+                self._set_analyzing_state(False)
+                self._apply_progress_ui(
+                    self._current_progress_ratio,
+                    phase="⏹ 解析を中止しました",
+                    detail="ユーザー操作により解析を中止しました",
+                    bar_color="#ADB5BD",
+                )
+                self.total_label.configure(text="解析が中止されました")
+
+            self._safe_after(0, _finish_cancelled)
         except DiagnosedAPIError as api_err:
-            self.update_status("通信・APIエラーが発生しました。")
-            self._safe_after(0, lambda: self.total_label.configure(text="全体合計: --- kg"))
-            self._safe_after(0, lambda d=api_err.diag: show_api_error_dialog(self, d))
+            def _finish_api_error(d=api_err.diag):
+                self._set_analyzing_state(False)
+                self._apply_progress_ui(
+                    self._current_progress_ratio,
+                    phase="⚠️ 通信・APIエラー",
+                    detail="通信・APIエラーが発生しました",
+                    bar_color=COLOR_DANGER,
+                )
+                self.total_label.configure(text="全体合計: --- kg / 概算 --- 円")
+                show_api_error_dialog(self, d)
+
+            self._safe_after(0, _finish_api_error)
         except Exception as e:
-            self.update_status("エラーが発生しました。")
-            self._safe_after(0, lambda: self.total_label.configure(text="全体合計: --- kg"))
             diag = diagnose_api_error(
                 "azure" if engine == "azure" else "gemini",
                 e,
                 endpoint=settings.get("azure_endpoint", "") if engine == "azure" else "",
             )
-            self._safe_after(0, lambda d=diag: show_api_error_dialog(self, d))
-        finally:
-            self._safe_after(0, lambda: self._set_analyzing_state(False))
+
+            def _finish_error(d=diag):
+                self._set_analyzing_state(False)
+                self._apply_progress_ui(
+                    self._current_progress_ratio,
+                    phase="⚠️ エラー発生",
+                    detail="解析中にエラーが発生しました",
+                    bar_color=COLOR_DANGER,
+                )
+                self.total_label.configure(text="全体合計: --- kg / 概算 --- 円")
+                show_api_error_dialog(self, d)
+
+            self._safe_after(0, _finish_error)
 
     def _refresh_summary_views(self, data):
-        """見積り・搬送サマリータブおよび下部合計ラベルを最新単価で再描画する"""
-        default_price = safe_float(self.unit_price_entry.get()) or safe_float(
-            self.api_settings.get("default_unit_price", 250.0)
-        )
+        """見積り・搬送サマリータブ・最大外形寸法バー・下部合計ラベルを最新単価で再描画する"""
+        default_price = self._get_effective_default_unit_price()
         default_den = safe_float(data.get("default_density", 7.85)) or 7.85
         summary = build_estimation_and_logistics_summary(
             data,
@@ -1651,9 +2009,23 @@ class DrawingAnalysisApp(ctk.CTk):
         if not summary:
             return
 
-        # トラック選定カード更新
+        # 製品最大外形寸法（最大長さ・最大幅・最大高さ）＆ 総重量の更新
         truck = summary["truck"]
         od = summary["overall_dimensions"]
+        len_txt = f"{od['length_mm']:,.0f} mm" if od["length_mm"] > 0 else "--- mm"
+        wid_txt = f"{od['width_mm']:,.0f} mm" if od["width_mm"] > 0 else "--- mm"
+        hei_txt = f"{od['height_mm']:,.0f} mm" if od["height_mm"] > 0 else "--- mm"
+        wt_txt = f"{summary['total_weight_kg']:,.2f} kg" if summary["total_weight_kg"] > 0 else "--- kg"
+
+        self.dim_length_label.configure(text=len_txt)
+        self.dim_width_label.configure(text=wid_txt)
+        self.dim_height_label.configure(text=hei_txt)
+        self.dim_weight_label.configure(text=wt_txt)
+        self.dims_bar_label.configure(
+            text=f"📏 最大外形寸法:  最大長さ (L) {len_txt}  ｜  最大幅 (W) {wid_txt}  ｜  最大高さ (H) {hei_txt}"
+        )
+
+        # トラック選定カード更新
         self.truck_badge.configure(text=f" 推奨: {truck['recommended_truck']} ")
 
         detail_lines = [
@@ -1870,9 +2242,7 @@ class DrawingAnalysisApp(ctk.CTk):
                 break
 
         self.last_result_data = data
-        default_price = safe_float(self.unit_price_entry.get()) or safe_float(
-            self.api_settings.get("default_unit_price", 250.0)
-        )
+        default_price = self._get_effective_default_unit_price()
         has_any_data = bool(
             build_export_tables(
                 data,
@@ -1887,9 +2257,7 @@ class DrawingAnalysisApp(ctk.CTk):
         if not self.last_result_data:
             return
 
-        default_price = safe_float(self.unit_price_entry.get()) or safe_float(
-            self.api_settings.get("default_unit_price", 250.0)
-        )
+        default_price = self._get_effective_default_unit_price()
         tables = build_export_tables(
             self.last_result_data,
             custom_prices=self.api_settings.get("material_unit_prices", {}),
